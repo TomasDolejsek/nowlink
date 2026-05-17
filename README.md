@@ -16,7 +16,7 @@ that LLMs can reason about without hallucinating field names.
 
 | Version | Focus | Status |
 |---------|-------|--------|
-| v0.0 — Foundation | Auth, skeleton, Claude Desktop connection | 🔨 In progress |
+| v0.0 — Foundation | Auth, skeleton, Claude Desktop connection | ✅ Complete |
 | v0.1 — Read | Query, get record, describe table | Planned |
 | v0.2 — Write | Create and update single records | Planned |
 | v0.3 — Safe Bulk | Preview + execute bulk operations | Planned |
