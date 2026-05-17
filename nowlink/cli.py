@@ -66,6 +66,20 @@ def connect():
     else:
         config_path = Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
 
+    # Auto-detect the nowlink executable path from the current Python environment.
+    # Claude Desktop does not inherit the virtual environment PATH, so we must
+    # write the absolute path to the executable, not just "nowlink".
+    executable = Path(sys.executable)
+    if sys.platform == "win32":
+        nowlink_exe = executable.parent / "nowlink.exe"
+    else:
+        nowlink_exe = executable.parent / "nowlink"
+
+    if not nowlink_exe.exists():
+        console.print(f"[bold red]✗ Could not find nowlink executable at:[/bold red] {nowlink_exe}")
+        console.print("Make sure NowLink is installed in the active virtual environment.")
+        raise typer.Exit(1)
+
     # Read existing config or start fresh
     if config_path.exists():
         with open(config_path) as f:
@@ -78,7 +92,7 @@ def connect():
         config["mcpServers"] = {}
 
     config["mcpServers"]["nowlink"] = {
-        "command": "C:\\Tom\\Programming\\08_NowLink\\.venv\\Scripts\\nowlink.exe",
+        "command": str(nowlink_exe),
         "args": ["serve"]
     }
 
@@ -87,6 +101,7 @@ def connect():
         json.dump(config, f, indent=2)
 
     console.print(f"\n[bold green]✓ Claude Desktop configured[/bold green]")
+    console.print(f"  Executable: {nowlink_exe}")
     console.print(f"  Config: {config_path}")
     console.print("\n[yellow]Restart Claude Desktop to activate NowLink.[/yellow]\n")
 
