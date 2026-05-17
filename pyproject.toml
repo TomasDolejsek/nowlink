@@ -1,0 +1,21 @@
+[project]
+name = "nowlink"
+version = "0.0.1"
+description = "MCP server for ServiceNow — clean tools, shaped data, safe writes"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "fastmcp",
+    "httpx",
+    "keyring",
+    "python-dotenv",
+    "rich",
+    "typer",
+]
+
+[project.scripts]
+nowlink = "nowlink.cli:app"
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
