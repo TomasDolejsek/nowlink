@@ -68,7 +68,7 @@ def fetch_token(creds: dict) -> dict:
         "client_secret": creds["client_secret"],
         "username": creds["username"],
         "password": creds["password"],
-    })
+    }, verify=False)
 
     if response.status_code != 200:
         raise RuntimeError(f"Failed to get token: {response.text}")
@@ -129,7 +129,8 @@ def verify_connection() -> dict:
             "sysparm_query": f"user_name={creds['username']}",
             "sysparm_fields": "user_name,name,roles",
             "sysparm_limit": "1",
-        }
+        },
+        verify=False,
     )
 
     if response.status_code == 200:

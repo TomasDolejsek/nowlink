@@ -56,13 +56,46 @@ def whoami():
 @app.command()
 def connect():
     """Configure Claude Desktop to use NowLink."""
-    console.print("[bold yellow]nowlink connect[/] — not yet implemented")
+    import json
+    import sys
+    from pathlib import Path
+
+    # Locate claude_desktop_config.json
+    if sys.platform == "win32":
+        config_path = Path.home() / "AppData" / "Roaming" / "Claude" / "claude_desktop_config.json"
+    else:
+        config_path = Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+
+    # Read existing config or start fresh
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+    else:
+        config = {}
+
+    # Merge NowLink in — don't overwrite other MCP servers
+    if "mcpServers" not in config:
+        config["mcpServers"] = {}
+
+    config["mcpServers"]["nowlink"] = {
+        "command": "C:\\Tom\\Programming\\08_NowLink\\.venv\\Scripts\\nowlink.exe",
+        "args": ["serve"]
+    }
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    console.print(f"\n[bold green]✓ Claude Desktop configured[/bold green]")
+    console.print(f"  Config: {config_path}")
+    console.print("\n[yellow]Restart Claude Desktop to activate NowLink.[/yellow]\n")
 
 
 @app.command()
 def serve():
     """Start the NowLink MCP server."""
-    console.print("[bold yellow]nowlink serve[/] — not yet implemented")
+    from nowlink.server import mcp
+    mcp.run()
 
 
 if __name__ == "__main__":
