@@ -14,18 +14,28 @@ that LLMs can reason about without hallucinating field names.
 
 ## Status
 
-| Version | Focus | Status |
-|---------|-------|--------|
-| v0.0 — Foundation | Auth, skeleton, Claude Desktop connection | ✅ Complete |
-| v0.1 — Read | Query, get record, describe table | Planned |
-| v0.2 — Write | Create and update single records | Planned |
-| v0.3 — Safe Bulk | Preview + execute bulk operations | Planned |
-| v0.4 — Flows | Trigger flows, check execution | Planned |
-| v0.5 — Extensible | Plugin API, PyPI release | Planned |
+| Version | Focus | Week | Status |
+|---------|-------|------|--------|
+| v0.0 — Foundation | Auth, skeleton, Claude Desktop connection | 1 | ✅ Complete |
+| v0.1 — Read | Query, get record, describe table | 1 | ✅ Complete |
+| v0.2 — Write | Create and update single records | 2 | Planned |
+| v0.3 — Safe Bulk | Preview + execute bulk operations | 3 | Planned |
+| v0.4 — Flows | Trigger flows, check execution | 4 | Planned |
+| v0.5 — Extensible | Plugin API, PyPI release | 5–6 | Planned |
+
+## Integration user roles
+
+The `nowlink.dev` integration user requires these roles:
+
+| Role | Required for |
+|------|-------------|
+| `rest_service` | OAuth authentication, basic API access |
+| `itil` | Read access to incident, problem, change, task tables |
+| `personalize_dictionary` | Read access to `sys_dictionary` (used by `describe_table`) |
 
 ## Installation
 
-_Coming soon — install instructions will be added when v0.1 is released._
+_Coming soon — install instructions will be added when v0.1 is released publicly._
 
 ## License
 

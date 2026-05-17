@@ -1,6 +1,10 @@
 # Pycharm local folder
 .idea/
 
+# Session notes — internal only, not committed
+docs/content/
+docs/sessions/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -155,7 +159,7 @@ activemq-data/
 .envrc
 .venv
 env/
-venv/
+.venv/
 ENV/
 env.bak/
 venv.bak/

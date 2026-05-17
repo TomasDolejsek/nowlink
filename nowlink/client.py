@@ -65,6 +65,7 @@ def query_records(table: str, sysparm_query: str = "", fields: list[str] | None 
         "sysparm_limit": str(limit),
         "sysparm_display_value": "all",  # returns both display value and raw value
         "sysparm_exclude_reference_link": "true",  # suppress link objects for references
+        "sysparm_order_by_desc": "sys_updated_on",  # most recently updated first
     }
     if sysparm_query:
         params["sysparm_query"] = sysparm_query
