@@ -40,7 +40,7 @@ cd nowlink
 pip install -e .
 nowlink init
 nowlink connect
-# Restart Claude Desktop
+Restart Claude Desktop
 
 ## License
 
