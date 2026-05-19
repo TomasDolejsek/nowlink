@@ -35,7 +35,12 @@ The `nowlink.dev` integration user requires these roles:
 
 ## Installation
 
-_Coming soon — install instructions will be added when v0.1 is released publicly._
+git clone https://github.com/TomasDolejsek/nowlink
+cd nowlink
+pip install -e .
+nowlink init
+nowlink connect
+# Restart Claude Desktop
 
 ## License
 
