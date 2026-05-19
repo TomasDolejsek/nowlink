@@ -1,6 +1,6 @@
 # NowLink
 
-> MCP server for ServiceNow — clean tools, shaped data, safe writes
+> MCP server for ServiceNow
 
 ⚠️ Under active development. Not ready for use yet.
 
