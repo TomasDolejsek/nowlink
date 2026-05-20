@@ -1,6 +1,6 @@
 # NowLink
 
-> MCP server for ServiceNow — clean tools, shaped data, safe writes
+> MCP server for ServiceNow
 
 ⚠️ Under active development. Not ready for use yet.
 
@@ -35,7 +35,14 @@ The `nowlink.dev` integration user requires these roles:
 
 ## Installation
 
-_Coming soon — install instructions will be added when v0.1 is released publicly._
+```bash
+git clone https://github.com/TomasDolejsek/nowlink
+cd nowlink
+pip install -e .
+nowlink init
+nowlink connect
+```
+Restart Claude Desktop after `nowlink connect`.
 
 ## License
 
