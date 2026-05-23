@@ -215,6 +215,23 @@ TABLE_FIELDS: dict[str, list[str]] = {
 }
 
 
+# ── Per-table mandatory fields ────────────────────────────────────────────────
+# sys_dictionary misses inherited fields (e.g. short_description on incident
+# is inherited from task, so it doesn't appear under name=incident).
+# This map is the authoritative source for mandatory field validation in
+# create_record. Only fields that ServiceNow will actually reject on create
+# if missing are listed here.
+
+TABLE_MANDATORY: dict[str, set[str]] = {
+    "incident": {"short_description", "caller_id"},
+    "problem": {"short_description"},
+    "change_request": {"short_description", "category"},
+    "sc_request": {"short_description"},
+    "sc_req_item": {"short_description"},
+    "task": {"short_description"},
+}
+
+
 # ── Core shaping logic ────────────────────────────────────────────────────────
 
 def _resolve_field_value(field_name: str, raw_value) -> str | None:
