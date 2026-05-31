@@ -364,6 +364,12 @@ def get_mandatory_fields(table: str) -> set[str]:
     missing these fields. NowLink validates before the write to give the user a
     clear, early warning rather than a timeout or silent bad data.
 
+    Known blind spot: Data Policies with "Apply to Web Services" checked enforce
+    mandatory fields at the server level and WILL cause the REST API to return 400.
+    These live in sys_data_policy_rule, not sys_dictionary, and are not checked here.
+    If a write is rejected with a 400 due to a Data Policy, NowLink surfaces the
+    error clearly — but this pre-flight check will not have warned the user in advance.
+
     Returns a set of field name strings. Returns empty set if query fails — callers
     handle gracefully (no validation rather than blocking on error).
     """
