@@ -15,6 +15,7 @@ encoded queries by hand, you ask Claude in plain language:
 > "Show me all P1 incidents without an assignment group"
 > "Create a test incident and assign it to the networking team"
 > "Update INC0001234 — change the priority to High"
+> "Update all open incidents assigned to the networking team to urgency High"
 
 NowLink handles the ServiceNow API calls, shapes the raw responses into clean
 token-efficient output, and keeps your credentials in your OS keychain — never in
@@ -31,7 +32,7 @@ a file that could accidentally get committed to git.
 | v0.0 — Foundation | Auth, skeleton, Claude Desktop connection | ✅ Complete |
 | v0.1 — Read | Query, get record, describe table | ✅ Complete |
 | v0.2 — Write | Create and update single records | ✅ Complete |
-| v0.3 — Safe Bulk | Preview + execute bulk operations | Planned |
+| v0.3 — Safe Bulk | Preview + execute bulk operations | ✅ Complete |
 | v0.4 — Flows | Trigger flows, check execution | Planned |
 | v0.5 — Extensible | Plugin API, PyPI release | Planned |
 
@@ -45,7 +46,7 @@ a file that could accidentally get committed to git.
 |------|-------------|
 | `query` | Find records matching a filter across any table |
 | `get_record` | Fetch a single record by number (INC0001234) or sys_id |
-| `describe_table` | Show the fields NowLink returns for a table |
+| `describe_table` | Show the fields and valid values for any table |
 
 ### Write (v0.2)
 
@@ -58,11 +59,26 @@ All write operations follow a mandatory two-step pattern:
 1. Claude calls the tool with `confirm=False` — shows a preview or diff, writes nothing
 2. You say yes — Claude calls again with `confirm=True` and executes the write
 
-Every confirmed write is logged to `~/.nowlink/logs/writes-YYYY-MM-DD.log`.
+### Bulk (v0.3)
+
+| Tool | What it does |
+|------|-------------|
+| `bulk_preview` | Count matching records, show a before→after sample, generate a session token |
+| `bulk_execute` | Execute the bulk update using the token from bulk_preview |
+| `get_write_log` | Read NowLink's write audit log — every create and update |
+
+Bulk operations follow a mandatory two-turn pattern:
+1. `bulk_preview` — Claude shows count, sample table with before→after, and asks "Shall I execute?"
+2. You say yes — Claude calls `bulk_execute` with the session token
+
+The session token encodes the table, filter, and fields. Claude cannot modify the
+operation between preview and execute. Token expires after 5 minutes. Hard limit:
+500 records per bulk operation.
+
+Every confirmed write and bulk update is logged to `~/.nowlink/logs/writes-YYYY-MM-DD.log`.
 
 **NowLink will never expose a delete operation.** ServiceNow is designed around state —
-records are closed and cancelled, not deleted. Use `update_record` with state
-`Cancelled` or `Closed` instead.
+records are closed and cancelled, not deleted.
 
 ---
 
@@ -146,7 +162,8 @@ Non-secret config lives in `.env` in the project root (never committed to git):
 |----------|---------|-------------|
 | `NOWLINK_INSTANCE_URL` | — | Your ServiceNow instance URL |
 | `NOWLINK_PAGE_SIZE` | `20` | Default records returned per query |
-| `NOWLINK_REQUEST_TIMEOUT` | `60` | HTTP timeout in seconds. Lower for production, raise for slow PDIs |
+| `NOWLINK_REQUEST_TIMEOUT` | `60` | HTTP timeout in seconds |
+| `NOWLINK_BULK_CHUNK_SLEEP` | `1.0` | Seconds between bulk batch chunks |
 
 Copy `.env.example` to `.env` to get started.
 
@@ -171,18 +188,29 @@ Write tools require raw ServiceNow coded values, not display labels:
 | `state` (incident) | `"6"` | Resolved |
 | `state` (incident) | `"7"` | Closed |
 
+For unfamiliar tables or fields, ask Claude to call `describe_table` first.
+
 ### Priority on incidents
 
-On most ServiceNow instances, priority is auto-calculated from impact and urgency via
-a business rule. Setting `priority` directly gets overwritten immediately after the
-write. To set priority to P1, set `impact=1` and `urgency=1` — priority follows
-automatically.
+Priority is auto-calculated from impact × urgency via a business rule. Setting
+`priority` directly gets overwritten immediately. To set P1 — set `impact=1`
+and `urgency=1` and let ServiceNow derive priority automatically.
+
+### Mandatory field validation
+
+Before any create, NowLink walks the table inheritance chain via `sys_db_object`
+and queries `sys_dictionary` for mandatory fields — including inherited ones. A
+custom table extending `task` will have `short_description` flagged as mandatory
+if that's how your instance is configured.
+
+Note: `sys_dictionary.mandatory` reflects database-level constraints. The ServiceNow
+REST API does not enforce these — the validation is NowLink's pre-flight UX layer.
+Fields enforced only via UI Policies (browser-only) will not appear in this check.
 
 ### caller_id on incident creates
 
 If you don't specify `caller_id` when creating an incident, NowLink automatically
-uses the integration user as the caller. You can override this by providing
-`caller_id` explicitly.
+uses the integration user as the caller. Override by providing `caller_id` explicitly.
 
 ---
 
@@ -190,7 +218,7 @@ uses the integration user as the caller. You can override this by providing
 
 ```bash
 # Run all tests
-pytest -v
+python -m pytest tests/ -v
 
 # Lint
 ruff check nowlink/
@@ -203,14 +231,15 @@ nowlink/
 ├── nowlink/
 │   ├── auth.py      # OAuth flow, credential storage, token management
 │   ├── cli.py       # CLI entry points: init, whoami, connect, serve
-│   ├── client.py    # ServiceNow Table API HTTP wrapper
+│   ├── client.py    # ServiceNow Table API HTTP wrapper + bulk operations
 │   ├── logger.py    # Tool call logging
 │   ├── safety.py    # Field validation, diff generation, write audit logging
-│   ├── server.py    # FastMCP server and tool definitions
+│   ├── server.py    # FastMCP server, tool definitions, session token store
 │   └── shaper.py    # Data transformation — allowlists, value maps, reference resolution
 └── tests/
-    ├── test_shaper.py   # 17 tests
-    └── test_safety.py   # 16 tests
+    ├── test_shaper.py       # 17 tests — data transformation
+    ├── test_safety.py       # 16 tests — validation, diff, write logging
+    └── test_bulk_tokens.py  # 20 tests — session tokens, hard limit, bulk diff
 ```
 
 ---
