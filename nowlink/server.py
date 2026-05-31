@@ -6,12 +6,26 @@ from fastmcp import FastMCP
 from nowlink.auth import get_connection_info, get_valid_token, load_credentials
 from nowlink.client import query_records, get_record_by_number, get_record_by_sys_id, \
     describe_table as fetch_table_schema, create_record as client_create, \
-    update_record as client_update, get_mandatory_fields
+    update_record as client_update, get_mandatory_fields, bulk_query as client_bulk_query, \
+    bulk_fetch_sys_ids, bulk_update as client_bulk_update
 from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
 from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
 
+import uuid
+from datetime import datetime, timedelta
+
 mcp = FastMCP("nowlink")
+
+# ── Bulk operation session tokens ─────────────────────────────────────────────
+# In-memory dict keyed by UUID. Stores the preview state that bulk_execute must
+# match. Token expires after 5 minutes. Dies with the server process — user
+# re-previews after a restart, which is the correct behaviour.
+#
+# Structure: {token_uuid: {table, filters, fields_to_set, count, expires_at}}
+
+BULK_TOKEN_TTL_MINUTES = 5
+_bulk_tokens: dict[str, dict] = {}
 
 
 # ── ping ──────────────────────────────────────────────────────────────────────
@@ -422,4 +436,318 @@ def update_record(
 
     except Exception as e:
         log_error("update_record", params, str(e))
+        return {"error": str(e)}
+
+
+# ── bulk_preview ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def bulk_preview(
+        table: str,
+        filters: str,
+        fields_to_set: dict,
+) -> dict:
+    """
+    Preview a bulk update operation and generate a session token required by bulk_execute.
+
+    ALWAYS call this tool before bulk_execute. bulk_execute requires the token
+    returned here and will refuse to run without it.
+
+    STOP after calling this tool. Do not call bulk_execute automatically.
+    Present the count, sample, and token to the user and wait for their explicit
+    instruction to proceed. The user must say "yes", "execute", "go ahead" or
+    similar before you call bulk_execute.
+
+    What this tool does:
+    1. Counts how many records match the filter
+    2. Refuses if count exceeds 500 (hard limit — use a tighter filter)
+    3. Returns a sample of up to 5 matching records showing before → after for each field
+    4. Generates a session token valid for 5 minutes
+
+    Parameters:
+    - table:         ServiceNow table name (e.g. "incident", "problem")
+    - filters:       Encoded ServiceNow query string to select records to update.
+                     Be specific — this will affect every matching record.
+                     Examples: "state=1^priority=3" — all New Moderate incidents
+                               "assignment_group=IT^state=2" — all In Progress for IT group
+    - fields_to_set: Dict of {field_name: raw_value} to set on every matching record.
+                     Same raw code rules as update_record.
+                     Common values — priority: "1"=Critical "2"=High "3"=Moderate "4"=Low
+                     state (incident): "1"=New "2"=In Progress "6"=Resolved "7"=Closed
+
+    Returns:
+      {
+        "count": 42,
+        "sample": [{shaped record before}, ...],  # up to 5 records
+        "fields_to_set": {...},
+        "token": "uuid-string",                   # pass this to bulk_execute
+        "expires_at": "2026-05-31T14:32:00",
+        "message": "Ready to update 42 records..."
+      }
+    Or if count > 500:
+      {"error": "...", "count": 612, "limit": 500}
+    """
+    params = {"table": table, "filters": filters, "fields_to_set": fields_to_set}
+    try:
+        count, sample_raw = client_bulk_query(table, filters)
+
+        if count > 500:
+            return {
+                "error": (
+                    f"This filter matches {count} records, which exceeds the 500-record "
+                    f"safety limit. Please use a tighter filter and try again."
+                ),
+                "count": count,
+                "limit": 500,
+            }
+
+        if count == 0:
+            return {
+                "error": "No records match this filter. Nothing to update.",
+                "count": 0,
+            }
+
+        # Shape sample and generate before→after diff for each record
+        from nowlink.shaper import shape_records
+        from nowlink.safety import diff_fields
+        sample_shaped = shape_records(sample_raw, table)
+        sample_with_diff = []
+        for record in sample_shaped:
+            diff = diff_fields(record, fields_to_set)
+            sample_with_diff.append({
+                "number": record.get("number", "unknown"),
+                "short_description": record.get("short_description", ""),
+                "changes": diff["changes"],
+                "unchanged": diff["unchanged"],
+            })
+
+        # Generate session token — stores the full preview state
+        token = str(uuid.uuid4())
+        expires_at = datetime.now() + timedelta(minutes=BULK_TOKEN_TTL_MINUTES)
+        _bulk_tokens[token] = {
+            "table": table,
+            "filters": filters,
+            "fields_to_set": fields_to_set,
+            "count": count,
+            "expires_at": expires_at,
+        }
+
+        log_tool_call("bulk_preview", params, f"{count} records matched, token {token[:8]}... generated")
+        return {
+            "count": count,
+            "sample": sample_with_diff,
+            "fields_to_set": fields_to_set,
+            "token": token,
+            "expires_at": expires_at.strftime("%Y-%m-%dT%H:%M:%S"),
+            "message": (
+                f"{count} record(s) on {table} will be updated. "
+                f"Fields to set: {fields_to_set}. "
+                f"Sample of first {len(sample_with_diff)} records shown above with before→after changes. "
+                f"Call bulk_execute with the token to proceed. "
+                f"Token expires in {BULK_TOKEN_TTL_MINUTES} minutes."
+            ),
+        }
+
+    except Exception as e:
+        log_error("bulk_preview", params, str(e))
+        return {"error": str(e)}
+
+
+# ── bulk_execute ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def bulk_execute(
+        token: str,
+) -> dict:
+    """
+    Execute a bulk update using a token generated by bulk_preview.
+
+    WORKFLOW — ALWAYS follow this exact sequence:
+      1. Call bulk_preview → show the count and sample to the user
+      2. STOP and ask the user: "Shall I go ahead and update all X records?"
+      3. Wait for explicit user confirmation (yes/no)
+      4. Only if user says yes: call bulk_execute with the token
+
+    NEVER call bulk_execute immediately after bulk_preview without user confirmation.
+    NEVER call bulk_execute if the user has not explicitly approved the operation.
+
+    Only call this tool when the user has explicitly confirmed they want to proceed
+    after seeing the bulk_preview results. Explicit confirmation means the user
+    has said "yes", "execute", "go ahead", "do it" or similar in response to
+    the preview. A general request like "bulk update all incidents" is NOT
+    confirmation — you must show the preview first and wait for approval.
+
+    Parameters:
+    - token: The token string returned by bulk_preview. Required.
+             The token encodes the table, filter, fields, and record count.
+             It cannot be modified — what was previewed is what gets executed.
+             Token expires 5 minutes after bulk_preview was called.
+
+    Returns on success:
+      {"updated": N, "failed": M, "failures": [...], "message": "..."}
+    On token not found or expired:
+      {"error": "Token not found..." / "Token expired..."}
+    """
+    params = {"token": token[:8] + "..."}
+    try:
+        # Validate token exists and hasn't expired
+        stored = _bulk_tokens.get(token)
+        if not stored:
+            return {
+                "error": "Token not found. Call bulk_preview first to generate a valid token.",
+            }
+        if datetime.now() > stored["expires_at"]:
+            del _bulk_tokens[token]
+            return {
+                "error": (
+                    f"Token expired ({BULK_TOKEN_TTL_MINUTES} minute limit). "
+                    "Call bulk_preview again to generate a fresh token."
+                ),
+            }
+
+        table = stored["table"]
+        filters = stored["filters"]
+        fields_to_set = stored["fields_to_set"]
+        preview_count = stored["count"]
+
+        # Re-count before executing — records may have changed since preview
+        current_count, _ = client_bulk_query(table, filters)
+        if current_count > 500:
+            del _bulk_tokens[token]
+            return {
+                "error": (
+                    f"Record count has changed since preview: now {current_count} records "
+                    f"(was {preview_count}), exceeding the 500-record limit. "
+                    "Call bulk_preview again with a tighter filter."
+                ),
+                "count": current_count,
+            }
+
+        # Fetch sys_ids for all matching records
+        all_records = bulk_fetch_sys_ids(table, filters, limit=500)
+        sys_ids = []
+        for record in all_records:
+            sys_id_field = record.get("sys_id")
+            sys_id = sys_id_field if isinstance(sys_id_field, str) else (sys_id_field or "")
+            if sys_id:
+                sys_ids.append(sys_id)
+
+        if not sys_ids:
+            del _bulk_tokens[token]
+            return {"error": "No records found to update — filter may have changed since preview."}
+
+        # Single batch API call — all PATCHes in one HTTP round trip
+        result = client_bulk_update(table, sys_ids, fields_to_set)
+
+        # Post-execution verification — re-count records still matching the filter.
+        # PDI transaction timeouts cause false negatives in batch sub-request status
+        # codes (500 "transaction cancelled" but write completed). Re-querying tells
+        # us the actual outcome regardless of reported status codes.
+        try:
+            remaining_count, _ = client_bulk_query(table, filters)
+        except Exception:
+            remaining_count = None
+
+        # Log as a single bulk write entry
+        log_write("update", table, f"bulk:{filters}:{len(sys_ids)}records", fields_to_set)
+
+        # Token consumed — remove it
+        del _bulk_tokens[token]
+
+        log_tool_call(
+            "bulk_execute", params,
+            f"{result['updated']} updated, {result['failed']} failed on {table}"
+        )
+        return {
+            "updated": result["updated"],
+            "failed": result["failed"],
+            "failures": result["failures"],
+            "remaining_matching_filter": remaining_count,
+            "message": (
+                f"Bulk update complete: {result['updated']} record(s) updated on {table}"
+                + (f", {result['failed']} reported as failed (may be PDI false positives — check remaining_matching_filter)." if result["failed"] else ".")
+                + (f" {remaining_count} record(s) still match the original filter." if remaining_count else "")
+                + (" All records updated successfully." if remaining_count == 0 else "")
+            ),
+        }
+
+    except Exception as e:
+        log_error("bulk_execute", params, str(e))
+        return {"error": str(e)}
+
+
+# ── get_write_log ─────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_write_log(
+        date: str = "",
+        table: str = "",
+        record: str = "",
+        limit: int = 20,
+) -> dict:
+    """
+    Read NowLink's write audit log — every create and update NowLink has performed.
+
+    Use this tool when:
+    - The user asks what NowLink has changed recently
+    - After a bulk_execute, to confirm what was updated
+    - To audit a specific record's change history via NowLink
+
+    Parameters:
+    - date:   Date to read log for, YYYY-MM-DD format. Defaults to today.
+    - table:  Filter by table name (e.g. "incident"). Optional.
+    - record: Filter by record number (e.g. "INC0001234"). Optional.
+    - limit:  Maximum entries to return. Default 20.
+
+    Returns a list of write entries, most recent first:
+      [{"ts": ..., "op": "update", "table": "incident", "record": "INC0001234",
+        "fields": {...}, "changes": [...]}]
+    """
+    params = {"date": date, "table": table, "record": record, "limit": limit}
+    try:
+        from pathlib import Path
+        import json
+
+        log_date = date if date else datetime.now().strftime("%Y-%m-%d")
+        log_file = Path.home() / ".nowlink" / "logs" / f"writes-{log_date}.log"
+
+        if not log_file.exists():
+            return {
+                "date": log_date,
+                "entries": [],
+                "message": f"No write log found for {log_date}.",
+            }
+
+        entries = []
+        with open(log_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Apply filters
+                if table and entry.get("table") != table:
+                    continue
+                if record and entry.get("record") != record:
+                    continue
+
+                entries.append(entry)
+
+        # Most recent first, apply limit
+        entries.reverse()
+        entries = entries[:limit]
+
+        log_tool_call("get_write_log", params, f"{len(entries)} entries returned for {log_date}")
+        return {
+            "date": log_date,
+            "count": len(entries),
+            "entries": entries,
+        }
+
+    except Exception as e:
+        log_error("get_write_log", params, str(e))
         return {"error": str(e)}

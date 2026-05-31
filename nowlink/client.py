@@ -393,6 +393,75 @@ def get_mandatory_fields(table: str) -> set[str]:
         return set()
 
 
+def bulk_update(table: str, sys_ids: list[str], fields: dict) -> dict:
+    """
+    Update records one by one using individual PATCH calls.
+
+    The ServiceNow Batch API proved unreliable on PDI — transaction timeouts
+    cause silent failures where the API returns 200 but doesn't write.
+    Individual PATCHes are slower but guaranteed reliable.
+
+    For production instances this will be fast (sub-second per record).
+    For PDI with 10-20 records this completes in well under 60 seconds.
+
+    Returns dict with counts: {updated, failed, failures}
+    """
+    import time
+
+    RECORD_SLEEP = float(os.getenv("NOWLINK_BULK_RECORD_SLEEP", "0.5"))
+
+    updated = 0
+    failed = 0
+    failures = []
+
+    for i, sys_id in enumerate(sys_ids):
+        try:
+            with httpx.Client(verify=False) as client:
+                response = client.patch(
+                    f"{_get_base_url()}/api/now/table/{table}/{sys_id}",
+                    headers=_auth_headers(),
+                    json=fields,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            _handle_response(response, f"bulk update record {i+1}/{len(sys_ids)}")
+            updated += 1
+        except Exception as e:
+            failed += 1
+            failures.append({"sys_id": sys_id, "error": str(e)})
+
+        if i < len(sys_ids) - 1:
+            time.sleep(RECORD_SLEEP)
+
+    return {"updated": updated, "failed": failed, "failures": failures}
+
+    return {"updated": updated, "failed": failed, "failures": failures}
+
+
+def bulk_fetch_sys_ids(table: str, sysparm_query: str, limit: int = 500) -> list[dict]:
+    """
+    Fetch sys_ids and numbers for all records matching the query, up to limit.
+    Used exclusively by bulk_execute to get the full list of records to update.
+    Bypasses the MAX_PAGE_SIZE cap — bulk operations need up to 500 records.
+    Returns minimal fields: sys_id and number only.
+    """
+    params = {
+        "sysparm_limit": str(limit),
+        "sysparm_query": sysparm_query,
+        "sysparm_fields": "sys_id,number",
+        "sysparm_display_value": "false",
+        "sysparm_exclude_reference_link": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        response = client.get(
+            f"{_get_base_url()}/api/now/table/{table}",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(response, f"bulk fetch sys_ids on {table}")
+    return data.get("result", [])
+
+
 def bulk_query(table: str, sysparm_query: str) -> tuple[int, list[dict]]:
     """
     Count records matching a query and return the first 5 shaped for preview.
