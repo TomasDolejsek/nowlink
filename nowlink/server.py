@@ -6,7 +6,7 @@ from fastmcp import FastMCP
 from nowlink.auth import get_connection_info, get_valid_token, load_credentials
 from nowlink.client import query_records, get_record_by_number, get_record_by_sys_id, \
     describe_table as fetch_table_schema, create_record as client_create, \
-    update_record as client_update
+    update_record as client_update, get_mandatory_fields
 from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
 from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
@@ -214,24 +214,27 @@ def create_record(
     Parameters:
     - table:   ServiceNow table name (e.g. "incident", "problem", "change_request")
     - fields:  Dict of field names and values to set on the new record.
-               CRITICAL — field values must be RAW ServiceNow codes, not display labels:
+               CRITICAL — field values must be RAW ServiceNow codes, not display labels.
+               For unfamiliar tables or fields, call describe_table first to check valid values.
+
+               Common values for standard ITSM tables:
                  priority:  "1"=Critical  "2"=High  "3"=Moderate  "4"=Low
                  impact:    "1"=High  "2"=Medium  "3"=Low
                  urgency:   "1"=High  "2"=Medium  "3"=Low
-                 state:     incident: "1"=New  "2"=In Progress  "6"=Resolved
+                 state (incident): "1"=New  "2"=In Progress  "6"=Resolved  "7"=Closed
+                 state (problem):  "101"=New  "106"=Resolved  "107"=Closed
+                 state (change):   "-5"=New  "-1"=Implement  "3"=Closed
                Reference fields (assigned_to, caller_id, assignment_group) accept
-               either sys_id or user_name/name — ServiceNow resolves them.
-               Text fields (short_description, description) accept plain strings.
-- confirm: False = preview only (default). True = execute the create.
-
-    Mandatory fields for incident: short_description, caller_id
-    Mandatory fields for problem: short_description
-    Mandatory fields for change_request: short_description, category
+               sys_id or user_name/name — ServiceNow resolves them.
+               caller_id: auto-filled from credentials for incident if not provided.
+               For custom tables: call describe_table to discover field names and types.
 
     Returns on preview (confirm=False):
-      {"preview": true, "table": ..., "fields_to_create": {...}, "validation_errors": [...]}
+      {"preview": true, "table": ..., "fields_to_create": {...}}
     Returns on success (confirm=True):
       {"created": true, "table": ..., "number": "INC0012345", "sys_id": "...", "record": {...}}
+    If ServiceNow rejects the create (missing required fields, ACL, etc.):
+      {"error": "ServiceNow error on create on incident: ..."}
     """
     params = {"table": table, "fields": fields, "confirm": confirm}
 
@@ -241,19 +244,46 @@ def create_record(
             creds = load_credentials()
             fields = {**fields, "caller_id": creds["username"]}
 
+        # Pre-flight mandatory field validation.
+        # Walks the full table inheritance chain via sys_db_object, then queries
+        # sys_dictionary for mandatory=true fields across the chain.
+        # This is NowLink's validation layer — the REST API may accept records
+        # missing these fields, but we warn the user before they confirm.
+        # Falls back to no validation if sys_db_object is inaccessible.
+        mandatory_fields = get_mandatory_fields(table)
+        missing = [
+            f for f in mandatory_fields
+            if not str(fields.get(f, "")).strip()
+        ]
+
         if not confirm:
             log_tool_call("create_record:preview", params, f"preview for {table}")
             return {
                 "preview": True,
                 "table": table,
                 "fields_to_create": fields,
+                "missing_mandatory_fields": missing,
                 "message": (
+                    f"Missing mandatory fields: {', '.join(missing)}. "
+                    "These fields are required — please provide them before confirming."
+                    if missing else
                     f"Ready to create a new {table} record with the above fields. "
                     "Call again with confirm=True to proceed."
                 ),
             }
 
-        # confirm=True — execute the write
+        # confirm=True — block if mandatory fields are missing
+        if missing:
+            return {
+                "error": "Cannot create record — mandatory fields missing",
+                "missing_mandatory_fields": missing,
+                "message": (
+                    f"The following fields are required but were not provided: "
+                    f"{', '.join(missing)}. Please include them and try again."
+                ),
+            }
+
+        # Execute the write
         raw_result = client_create(table, fields)
         shaped_result = shape_record(raw_result, table)
         number = shaped_result.get("number") or raw_result.get("number", {}).get("value", "unknown")
@@ -302,16 +332,19 @@ def update_record(
     - identifier: Record number (e.g. "INC0001234") or 32-character sys_id hex string.
     - fields:     Dict of field names and values to change. Only include fields you want
                   to modify — unspecified fields are not touched (PATCH semantics).
-                  CRITICAL — field values must be RAW ServiceNow codes, not display labels:
+                  CRITICAL — field values must be RAW ServiceNow codes, not display labels.
+                  For unfamiliar tables or fields, call describe_table first to check valid values.
+
+                  Common values for standard ITSM tables:
                     priority:  "1"=Critical  "2"=High  "3"=Moderate  "4"=Low
                     impact:    "1"=High  "2"=Medium  "3"=Low
                     urgency:   "1"=High  "2"=Medium  "3"=Low
-                    state:     incident: "1"=New "2"=In Progress "6"=Resolved "7"=Closed
-                               problem:  "101"=New "106"=Resolved "107"=Closed
-                               change:   "-5"=New "-1"=Implement "3"=Closed
+                    state (incident): "1"=New "2"=In Progress "6"=Resolved "7"=Closed
+                    state (problem):  "101"=New "106"=Resolved "107"=Closed
+                    state (change):   "-5"=New "-1"=Implement "3"=Closed
                   Reference fields (assigned_to, caller_id, assignment_group) accept
-                  either sys_id or user_name/name — ServiceNow resolves them.
-                  Text fields accept plain strings.
+                  sys_id or user_name/name — ServiceNow resolves them.
+                  For custom tables: call describe_table to discover field names and types.
     - confirm:    False = preview only (default). True = execute the update.
 
     Returns on preview (confirm=False):

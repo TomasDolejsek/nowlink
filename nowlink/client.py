@@ -179,8 +179,8 @@ def _verify_create(table: str, fields: dict) -> dict:
 
     if not match_field:
         raise RuntimeError(
-            "Create timed out and no suitable field found to verify whether "
-            "the record was created. Check ServiceNow manually."
+            "ServiceNow did not respond in time. No suitable field found to verify "
+            "whether the record was created. Check ServiceNow manually."
         )
 
     query = f"{match_field}={match_value}^sys_created_on>={cutoff_str}"
@@ -208,9 +208,19 @@ def _verify_create(table: str, fields: dict) -> dict:
         # Record found — the POST completed despite the timeout
         return results[0]
 
+    # Nothing found — the write did not complete.
+    # On incident, a missing short_description is the most common cause:
+    # ServiceNow business rules hang on insert without a subject line,
+    # the request times out, and nothing is written.
+    hint = (
+        " Tip: on incident, a missing short_description often causes this — "
+        "ServiceNow business rules can hang on insert without a subject line."
+        if table == "incident" and "short_description" not in fields
+        else ""
+    )
     raise RuntimeError(
-        "Create timed out and no matching record was found in ServiceNow. "
-        "The record was likely not created. Please try again."
+        f"ServiceNow did not respond in time and the record was not created.{hint} "
+        "Please check that all required fields are provided and try again."
     )
 
 
@@ -295,6 +305,92 @@ def _verify_update(table: str, sys_id: str, fields: dict) -> dict:
 
     # All submitted fields match — update succeeded despite timeout.
     return result
+
+
+def get_table_ancestry(table: str) -> list[str]:
+    """
+    Walk sys_db_object upward via super_class to build the full inheritance chain.
+
+    Example: incident → task → (no further parent)
+    Returns: ["incident", "task"]
+
+    Used by get_mandatory_fields() to query sys_dictionary across the full ancestry
+    so inherited mandatory fields (e.g. short_description defined on task, inherited
+    by incident) are included.
+
+    Returns just [table] if the table has no parent or sys_db_object is inaccessible.
+    """
+    ancestry = []
+    current = table
+    seen = set()
+
+    while current and current not in seen:
+        ancestry.append(current)
+        seen.add(current)
+
+        params = {
+            "sysparm_query": f"name={current}",
+            "sysparm_fields": "name,super_class.name",
+            "sysparm_limit": "1",
+            "sysparm_display_value": "true",
+        }
+        with httpx.Client(verify=False) as client:
+            response = client.get(
+                f"{_get_base_url()}/api/now/table/sys_db_object",
+                headers=_auth_headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+        data = _handle_response(response, f"sys_db_object lookup for {current}")
+        results = data.get("result", [])
+        if not results:
+            break
+        parent = results[0].get("super_class.name") or ""
+        current = parent.strip() if parent else ""
+
+    return ancestry
+
+
+def get_mandatory_fields(table: str) -> set[str]:
+    """
+    Return all mandatory field names for a table, including inherited ones.
+
+    Walks the full table inheritance chain via get_table_ancestry(), then queries
+    sys_dictionary once with nameIN{ancestry} to get all mandatory fields across
+    the chain.
+
+    IMPORTANT — this is NowLink's pre-flight validation, not a prediction of what
+    ServiceNow will enforce at the API level. The REST API may accept a record
+    missing these fields. NowLink validates before the write to give the user a
+    clear, early warning rather than a timeout or silent bad data.
+
+    Returns a set of field name strings. Returns empty set if query fails — callers
+    handle gracefully (no validation rather than blocking on error).
+    """
+    ancestry = get_table_ancestry(table)
+    if not ancestry:
+        return set()
+
+    ancestry_filter = ",".join(ancestry)
+    params = {
+        "sysparm_query": f"nameIN{ancestry_filter}^mandatory=true^active=true^elementISNOTEMPTY",
+        "sysparm_fields": "element",
+        "sysparm_limit": "200",
+        "sysparm_display_value": "true",
+    }
+    try:
+        with httpx.Client(verify=False) as client:
+            response = client.get(
+                f"{_get_base_url()}/api/now/table/sys_dictionary",
+                headers=_auth_headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+        data = _handle_response(response, f"mandatory fields for {table}")
+        results = data.get("result", [])
+        return {r["element"] for r in results if r.get("element")}
+    except Exception:
+        return set()
 
 
 def bulk_query(table: str, sysparm_query: str) -> tuple[int, list[dict]]:
