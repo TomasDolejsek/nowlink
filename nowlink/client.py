@@ -297,6 +297,69 @@ def _verify_update(table: str, sys_id: str, fields: dict) -> dict:
     return result
 
 
+def bulk_query(table: str, sysparm_query: str) -> tuple[int, list[dict]]:
+    """
+    Count records matching a query and return the first 5 shaped for preview.
+
+    Used exclusively by bulk_preview to:
+    1. Check whether the operation would exceed the 500-record hard limit
+    2. Show the user a sample of affected records before they confirm
+
+    Returns: (total_count, first_5_raw_records)
+
+    Uses sysparm_query with sysparm_limit=1 + X-Total-Count header for the
+    count — avoids fetching all records just to count them. Then fetches 5
+    for the sample.
+
+    Note: ServiceNow's X-Total-Count header reflects the true count for the
+    query, not just the page size. Reliable for limit enforcement.
+    """
+    # Step 1: get the true total count via a limit-1 request + response header
+    count_params = {
+        "sysparm_limit": "1",
+        "sysparm_query": sysparm_query,
+        "sysparm_display_value": "true",
+        "sysparm_exclude_reference_link": "true",
+    }
+    try:
+        with httpx.Client(verify=False) as client:
+            count_response = client.get(
+                f"{_get_base_url()}/api/now/table/{table}",
+                headers=_auth_headers(),
+                params=count_params,
+                timeout=REQUEST_TIMEOUT,
+            )
+        _handle_response(count_response, f"bulk count on {table}")
+
+        # X-Total-Count is set by ServiceNow when sysparm_no_count is not true
+        total_count = int(count_response.headers.get("X-Total-Count", "0"))
+    except Exception as e:
+        raise RuntimeError(f"Could not count records in {table}: {e}")
+
+    # Step 2: fetch first 5 for the sample preview
+    sample_params = {
+        "sysparm_limit": "5",
+        "sysparm_query": sysparm_query,
+        "sysparm_display_value": "all",
+        "sysparm_exclude_reference_link": "true",
+        "sysparm_order_by_desc": "sys_updated_on",
+    }
+    try:
+        with httpx.Client(verify=False) as client:
+            sample_response = client.get(
+                f"{_get_base_url()}/api/now/table/{table}",
+                headers=_auth_headers(),
+                params=sample_params,
+                timeout=REQUEST_TIMEOUT,
+            )
+        sample_data = _handle_response(sample_response, f"bulk sample on {table}")
+        sample_records = sample_data.get("result", [])
+    except Exception:
+        sample_records = []
+
+    return total_count, sample_records
+
+
 def describe_table(table: str) -> list[dict]:
     params = {
         "sysparm_query": f"name={table}^element!=NULL^active=true",

@@ -7,8 +7,8 @@ from nowlink.auth import get_connection_info, get_valid_token, load_credentials
 from nowlink.client import query_records, get_record_by_number, get_record_by_sys_id, \
     describe_table as fetch_table_schema, create_record as client_create, \
     update_record as client_update
-from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS, TABLE_MANDATORY
-from nowlink.safety import validate_fields, diff_fields, log_write
+from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
+from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
 
 mcp = FastMCP("nowlink")
@@ -161,7 +161,7 @@ def describe_table(table: str) -> dict:
         # under name=incident. The allowlist is what NowLink actually returns,
         # so it's the accurate answer to "what fields does this table have?"
         if table in TABLE_FIELDS:
-            mandatory = TABLE_MANDATORY.get(table, set())
+            mandatory = set()
             shaped = [
                 {
                     "field": field,
@@ -237,51 +237,23 @@ def create_record(
 
     try:
         # Inject caller_id default for incident if not provided.
-        # The integration user (nowlink.dev) is the natural default caller —
-        # avoids forcing Claude to always ask the user who the caller is.
-        # The user can always override by explicitly providing caller_id.
         if table == "incident" and "caller_id" not in fields:
             creds = load_credentials()
             fields = {**fields, "caller_id": creds["username"]}
 
-        # Validate mandatory fields.
-        # For known tables: use TABLE_MANDATORY (authoritative, includes inherited fields).
-        # For unknown tables: fall back to sys_dictionary via describe_table.
-        if table in TABLE_MANDATORY:
-            mandatory_fields = TABLE_MANDATORY[table]
-            errors = [
-                f"{f.replace('_', ' ').title()} ({f}) is mandatory but was not provided"
-                for f in mandatory_fields
-                if not str(fields.get(f, "")).strip()
-            ]
-        else:
-            raw_schema = fetch_table_schema(table)
-            shaped_schema = shape_table_schema(raw_schema)
-            errors = validate_fields(fields, shaped_schema)
-
         if not confirm:
-            # Preview mode — return what WOULD happen, write nothing
             log_tool_call("create_record:preview", params, f"preview for {table}")
             return {
                 "preview": True,
                 "table": table,
                 "fields_to_create": fields,
-                "validation_errors": errors,
                 "message": (
-                    "Validation errors must be resolved before confirming."
-                    if errors else
                     f"Ready to create a new {table} record with the above fields. "
                     "Call again with confirm=True to proceed."
                 ),
             }
 
         # confirm=True — execute the write
-        if errors:
-            return {
-                "error": "Cannot create record — mandatory fields missing",
-                "validation_errors": errors,
-            }
-
         raw_result = client_create(table, fields)
         shaped_result = shape_record(raw_result, table)
         number = shaped_result.get("number") or raw_result.get("number", {}).get("value", "unknown")

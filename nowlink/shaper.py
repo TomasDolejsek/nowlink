@@ -216,20 +216,19 @@ TABLE_FIELDS: dict[str, list[str]] = {
 
 
 # ── Per-table mandatory fields ────────────────────────────────────────────────
-# sys_dictionary misses inherited fields (e.g. short_description on incident
-# is inherited from task, so it doesn't appear under name=incident).
-# This map is the authoritative source for mandatory field validation in
-# create_record. Only fields that ServiceNow will actually reject on create
-# if missing are listed here.
-
-TABLE_MANDATORY: dict[str, set[str]] = {
-    "incident": {"short_description", "caller_id"},
-    "problem": {"short_description"},
-    "change_request": {"short_description", "category"},
-    "sc_request": {"short_description"},
-    "sc_req_item": {"short_description"},
-    "task": {"short_description"},
-}
+# REMOVED in v0.3.
+#
+# Original approach: hardcoded map of known-mandatory fields per table.
+# Problem: sys_dictionary.mandatory reflects database-level constraints only.
+# Most "mandatory" fields in the ServiceNow UI are enforced by UI Policies,
+# which only fire in the browser — the REST API doesn't see them at all.
+# On a standard PDI, short_description on incident has mandatory=false in
+# sys_dictionary, even though it's required in the UI.
+#
+# Decision: remove pre-flight mandatory validation entirely. Let ServiceNow
+# reject invalid creates and surface the error clearly through Claude.
+# ServiceNow is the authority. NowLink communicates the rejection cleanly.
+# See docs/decisions/v0.3-known-issues.md for the full rationale.
 
 
 # ── Core shaping logic ────────────────────────────────────────────────────────
