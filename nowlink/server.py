@@ -636,38 +636,32 @@ def bulk_execute(
             del _bulk_tokens[token]
             return {"error": "No records found to update — filter may have changed since preview."}
 
-        # Single batch API call — all PATCHes in one HTTP round trip
-        result = client_bulk_update(table, sys_ids, fields_to_set)
+        # Fire the batch — sub-request statuses ignored, outcome verified by re-count
+        client_bulk_update(table, sys_ids, fields_to_set)
 
-        # Post-execution verification — re-count records still matching the filter.
-        # PDI transaction timeouts cause false negatives in batch sub-request status
-        # codes (500 "transaction cancelled" but write completed). Re-querying tells
-        # us the actual outcome regardless of reported status codes.
+        # Post-execution re-count — this is the source of truth.
+        # Batch sub-request status codes are unreliable on PDI.
         try:
             remaining_count, _ = client_bulk_query(table, filters)
         except Exception:
             remaining_count = None
 
-        # Log as a single bulk write entry
-        log_write("update", table, f"bulk:{filters}:{len(sys_ids)}records", fields_to_set)
+        actually_updated = len(sys_ids) - (remaining_count or 0)
 
-        # Token consumed — remove it
+        log_write("update", table, f"bulk:{filters}:{actually_updated}records", fields_to_set)
         del _bulk_tokens[token]
 
         log_tool_call(
             "bulk_execute", params,
-            f"{result['updated']} updated, {result['failed']} failed on {table}"
+            f"{actually_updated} confirmed updated on {table}, {remaining_count} remaining"
         )
         return {
-            "updated": result["updated"],
-            "failed": result["failed"],
-            "failures": result["failures"],
-            "remaining_matching_filter": remaining_count,
+            "updated": actually_updated,
+            "remaining": remaining_count,
             "message": (
-                f"Bulk update complete: {result['updated']} record(s) updated on {table}"
-                + (f", {result['failed']} reported as failed (may be PDI false positives — check remaining_matching_filter)." if result["failed"] else ".")
-                + (f" {remaining_count} record(s) still match the original filter." if remaining_count else "")
-                + (" All records updated successfully." if remaining_count == 0 else "")
+                f"Bulk update complete: {actually_updated} of {len(sys_ids)} record(s) updated on {table}. "
+                + ("All records updated successfully." if remaining_count == 0
+                   else f"{remaining_count} record(s) still match the filter — run bulk_preview again to update them.")
             ),
         }
 

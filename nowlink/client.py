@@ -393,48 +393,63 @@ def get_mandatory_fields(table: str) -> set[str]:
         return set()
 
 
-def bulk_update(table: str, sys_ids: list[str], fields: dict) -> dict:
+def bulk_update(table: str, sys_ids: list[str], fields: dict) -> None:
     """
-    Update records one by one using individual PATCH calls.
+    Update multiple records using the ServiceNow Batch API in chunks.
+    POST /api/now/v1/batch — one HTTP round trip per chunk of 50 records.
 
-    The ServiceNow Batch API proved unreliable on PDI — transaction timeouts
-    cause silent failures where the API returns 200 but doesn't write.
-    Individual PATCHes are slower but guaranteed reliable.
+    Sub-request status codes are intentionally ignored — PDI transaction
+    timeouts cause false negatives (500 returned but write completed).
+    Callers verify actual outcome via a post-execution re-count query.
 
-    For production instances this will be fast (sub-second per record).
-    For PDI with 10-20 records this completes in well under 60 seconds.
-
-    Returns dict with counts: {updated, failed, failures}
+    Raises RuntimeError only if the outer batch HTTP call itself fails (4xx/5xx
+    on the batch endpoint, not on individual sub-requests).
     """
+    import json as _json
+    import base64
     import time
 
-    RECORD_SLEEP = float(os.getenv("NOWLINK_BULK_RECORD_SLEEP", "0.5"))
+    BATCH_CHUNK_SIZE = 50
+    CHUNK_SLEEP = float(os.getenv("NOWLINK_BULK_CHUNK_SLEEP", "1.0"))
 
-    updated = 0
-    failed = 0
-    failures = []
+    base_url = _get_base_url()
+    fields_b64 = base64.b64encode(_json.dumps(fields).encode()).decode()
 
-    for i, sys_id in enumerate(sys_ids):
-        try:
-            with httpx.Client(verify=False) as client:
-                response = client.patch(
-                    f"{_get_base_url()}/api/now/table/{table}/{sys_id}",
-                    headers=_auth_headers(),
-                    json=fields,
-                    timeout=REQUEST_TIMEOUT,
-                )
-            _handle_response(response, f"bulk update record {i+1}/{len(sys_ids)}")
-            updated += 1
-        except Exception as e:
-            failed += 1
-            failures.append({"sys_id": sys_id, "error": str(e)})
+    for chunk_start in range(0, len(sys_ids), BATCH_CHUNK_SIZE):
+        chunk = sys_ids[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
 
-        if i < len(sys_ids) - 1:
-            time.sleep(RECORD_SLEEP)
+        requests = [
+            {
+                "id": str(chunk_start + i),
+                "method": "PATCH",
+                "url": f"/api/now/table/{table}/{sys_id}",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "body": fields_b64,
+            }
+            for i, sys_id in enumerate(chunk)
+        ]
 
-    return {"updated": updated, "failed": failed, "failures": failures}
+        with httpx.Client(verify=False) as client:
+            response = client.post(
+                f"{base_url}/api/now/v1/batch",
+                headers=_auth_headers(),
+                json={
+                    "batch_request_id": f"nowlink-bulk-{chunk_start}",
+                    "rest_requests": requests,
+                },
+                timeout=max(REQUEST_TIMEOUT, 120),
+            )
 
-    return {"updated": updated, "failed": failed, "failures": failures}
+        # Only raise if the batch endpoint itself fails
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Batch API error {response.status_code} on chunk starting at {chunk_start}: "
+                f"{response.text[:200]}"
+            )
+
+        # Sub-request statuses intentionally ignored — verified by caller re-count
+        if chunk_start + BATCH_CHUNK_SIZE < len(sys_ids):
+            time.sleep(CHUNK_SLEEP)
 
 
 def bulk_fetch_sys_ids(table: str, sysparm_query: str, limit: int = 500) -> list[dict]:
