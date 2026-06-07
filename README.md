@@ -33,8 +33,9 @@ a file that could accidentally get committed to git.
 | v0.1 — Read | Query, get record, describe table | ✅ Complete |
 | v0.2 — Write | Create and update single records | ✅ Complete |
 | v0.3 — Safe Bulk | Preview + execute bulk operations | ✅ Complete |
-| v0.4 — Flows | Trigger flows, check execution | Planned |
-| v0.5 — Extensible | Plugin API, PyPI release | Planned |
+| v0.4 — Flows | Flow Designer bridge, trigger subflows | ✅ Complete (proof-of-concept) |
+| v0.5 — Smart Flows | Input discovery, validate before trigger | Planned |
+| v0.6 — Extensible | Plugin API, PyPI release | Planned |
 
 ---
 

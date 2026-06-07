@@ -107,6 +107,46 @@ def connect():
 
 
 @app.command()
+def setup_flows():
+    """Install the NowLink Flow Bridge on your ServiceNow instance."""
+    from nowlink.client import setup_flow_bridge
+    import httpx
+    console.print("\n[bold]Setting up NowLink Flow Bridge...[/bold]")
+    try:
+        result = setup_flow_bridge()
+        if result["created"]:
+            console.print(f"\n[bold green]✓ Flow bridge installed[/bold green]")
+        else:
+            console.print(f"\n[bold green]✓ Flow bridge already installed[/bold green]")
+        console.print(f"  Endpoints: {result['bridge_url']}/trigger-subflow")
+        console.print(f"             {result['bridge_url']}/trigger-flow")
+        console.print(f"             {result['bridge_url']}/trigger-action")
+        console.print(f"\n[yellow]Claude can now trigger Flow Designer subflows.[/yellow]\n")
+    except httpx.TimeoutException:
+        # PDI timed out — retry silently using idempotency check
+        try:
+            result = setup_flow_bridge()
+            if result["created"]:
+                console.print(f"\n[bold green]✓ Flow bridge installed[/bold green]")
+            else:
+                console.print(f"\n[bold green]✓ Flow bridge already installed[/bold green]")
+            console.print(f"  Endpoints: {result['bridge_url']}/trigger-subflow")
+            console.print(f"             {result['bridge_url']}/trigger-flow")
+            console.print(f"             {result['bridge_url']}/trigger-action")
+            console.print(f"\n[yellow]Claude can now trigger Flow Designer subflows.[/yellow]\n")
+        except Exception as e2:
+            console.print(f"\n[bold red]✗ Setup failed:[/bold red] {e2}\n")
+            raise typer.Exit(1)
+    except RuntimeError as e:
+        msg = str(e)
+        console.print(f"\n[bold red]✗ Setup failed:[/bold red] {msg}")
+        if "Access denied" in msg or "Unauthorized" in msg:
+            console.print("[yellow]Make sure nowlink.dev has the web_service_admin role.[/yellow]")
+        console.print()
+        raise typer.Exit(1)
+
+
+@app.command()
 def serve():
     """Start the NowLink MCP server."""
     from nowlink.server import mcp

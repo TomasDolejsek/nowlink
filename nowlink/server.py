@@ -7,7 +7,9 @@ from nowlink.auth import get_connection_info, get_valid_token, load_credentials
 from nowlink.client import query_records, get_record_by_number, get_record_by_sys_id, \
     describe_table as fetch_table_schema, create_record as client_create, \
     update_record as client_update, get_mandatory_fields, bulk_query as client_bulk_query, \
-    bulk_fetch_sys_ids, bulk_update as client_bulk_update
+    bulk_fetch_sys_ids, bulk_update as client_bulk_update, \
+    setup_flow_bridge as client_setup_flow_bridge, trigger_subflow as client_trigger_subflow, \
+    get_flow_status as client_get_flow_status, list_subflows as client_list_subflows
 from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
 from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
@@ -144,6 +146,104 @@ def get_record(
         return shaped
     except Exception as e:
         log_error("get_record", params, str(e))
+        return {"error": str(e)}
+
+
+# ── Flow tools ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_subflows() -> dict:
+    """
+    List all active, published Flow Designer subflows available on this ServiceNow instance.
+
+    Use this tool when the user asks what flows or subflows are available, or before
+    triggering a subflow to confirm the name. Returns the trigger_name for each subflow —
+    this is the value to pass to trigger_subflow as subflow_name.
+
+    Note: only SUBFLOWS are listed, not flows. Subflows have no trigger and are designed
+    for programmatic execution. Flows require an event trigger and cannot be triggered
+    via NowLink. If a user asks to trigger a "flow" by name, check this list first —
+    it may be implemented as a subflow.
+
+    Returns a list of subflows, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the subflow does
+        trigger_name: the value to pass to trigger_subflow (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        subflows = client_list_subflows()
+        log_tool_call("list_subflows", params, f"{len(subflows)} subflows returned")
+        return {"count": len(subflows), "subflows": subflows}
+    except Exception as e:
+        log_error("list_subflows", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by name with input variables.
+
+    subflow_name must be in 'scope.internal_name' format — use list_subflows first
+    to find the correct trigger_name. Example: 'global.nowlink_test_subflow'.
+
+    inputs is a dict of input variable names to values. The keys must match the
+    subflow's declared input variable names exactly. Check the subflow in Flow
+    Designer if unsure of the input names.
+
+    The subflow runs asynchronously in the background. This tool returns immediately
+    with an execution_id — it does NOT wait for the subflow to complete. Call
+    get_flow_status with the execution_id to check whether it completed successfully.
+
+    IMPORTANT: Always call list_subflows first if you are not certain of the exact
+    subflow_name. A wrong name returns an error immediately.
+
+    Returns:
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+
+    If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
+    in their terminal first.
+    """
+    params = {"subflow_name": subflow_name, "inputs": inputs}
+    try:
+        result = client_trigger_subflow(subflow_name, inputs)
+        log_tool_call("trigger_subflow", params, f"triggered — execution_id={result.get('execution_id')}")
+        return result
+    except Exception as e:
+        log_error("trigger_subflow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_flow_status(execution_id: str) -> dict:
+    """
+    Check the execution status of a subflow that was previously triggered.
+
+    execution_id is the value returned by trigger_subflow. Pass it here to find
+    out whether the subflow completed, is still running, or encountered an error.
+
+    Call this a few seconds after trigger_subflow — subflows on PDI typically
+    complete within 2–10 seconds. On production instances they are faster.
+
+    Returns:
+        state:             'Complete', 'Running', 'Error', or 'Cancelled'
+        name:              subflow display name
+        fault_description: error detail if state is Error, otherwise empty
+        output_vars:       output variable values if state is Complete
+
+    If state is 'Running', tell the user the subflow is still executing and offer
+    to check again. Do not call this tool in a loop automatically — always wait
+    for the user to ask for a status update.
+    """
+    params = {"execution_id": execution_id}
+    try:
+        result = client_get_flow_status(execution_id)
+        log_tool_call("get_flow_status", params, f"state={result.get('state')}")
+        return result
+    except Exception as e:
+        log_error("get_flow_status", params, str(e))
         return {"error": str(e)}
 
 
@@ -439,6 +539,104 @@ def update_record(
         return {"error": str(e)}
 
 
+# ── Flow tools ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_subflows() -> dict:
+    """
+    List all active, published Flow Designer subflows available on this ServiceNow instance.
+
+    Use this tool when the user asks what flows or subflows are available, or before
+    triggering a subflow to confirm the name. Returns the trigger_name for each subflow —
+    this is the value to pass to trigger_subflow as subflow_name.
+
+    Note: only SUBFLOWS are listed, not flows. Subflows have no trigger and are designed
+    for programmatic execution. Flows require an event trigger and cannot be triggered
+    via NowLink. If a user asks to trigger a "flow" by name, check this list first —
+    it may be implemented as a subflow.
+
+    Returns a list of subflows, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the subflow does
+        trigger_name: the value to pass to trigger_subflow (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        subflows = client_list_subflows()
+        log_tool_call("list_subflows", params, f"{len(subflows)} subflows returned")
+        return {"count": len(subflows), "subflows": subflows}
+    except Exception as e:
+        log_error("list_subflows", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by name with input variables.
+
+    subflow_name must be in 'scope.internal_name' format — use list_subflows first
+    to find the correct trigger_name. Example: 'global.nowlink_test_subflow'.
+
+    inputs is a dict of input variable names to values. The keys must match the
+    subflow's declared input variable names exactly. Check the subflow in Flow
+    Designer if unsure of the input names.
+
+    The subflow runs asynchronously in the background. This tool returns immediately
+    with an execution_id — it does NOT wait for the subflow to complete. Call
+    get_flow_status with the execution_id to check whether it completed successfully.
+
+    IMPORTANT: Always call list_subflows first if you are not certain of the exact
+    subflow_name. A wrong name returns an error immediately.
+
+    Returns:
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+
+    If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
+    in their terminal first.
+    """
+    params = {"subflow_name": subflow_name, "inputs": inputs}
+    try:
+        result = client_trigger_subflow(subflow_name, inputs)
+        log_tool_call("trigger_subflow", params, f"triggered — execution_id={result.get('execution_id')}")
+        return result
+    except Exception as e:
+        log_error("trigger_subflow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_flow_status(execution_id: str) -> dict:
+    """
+    Check the execution status of a subflow that was previously triggered.
+
+    execution_id is the value returned by trigger_subflow. Pass it here to find
+    out whether the subflow completed, is still running, or encountered an error.
+
+    Call this a few seconds after trigger_subflow — subflows on PDI typically
+    complete within 2–10 seconds. On production instances they are faster.
+
+    Returns:
+        state:             'Complete', 'Running', 'Error', or 'Cancelled'
+        name:              subflow display name
+        fault_description: error detail if state is Error, otherwise empty
+        output_vars:       output variable values if state is Complete
+
+    If state is 'Running', tell the user the subflow is still executing and offer
+    to check again. Do not call this tool in a loop automatically — always wait
+    for the user to ask for a status update.
+    """
+    params = {"execution_id": execution_id}
+    try:
+        result = client_get_flow_status(execution_id)
+        log_tool_call("get_flow_status", params, f"state={result.get('state')}")
+        return result
+    except Exception as e:
+        log_error("get_flow_status", params, str(e))
+        return {"error": str(e)}
+
+
 # ── bulk_preview ──────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -553,6 +751,104 @@ def bulk_preview(
         return {"error": str(e)}
 
 
+# ── Flow tools ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_subflows() -> dict:
+    """
+    List all active, published Flow Designer subflows available on this ServiceNow instance.
+
+    Use this tool when the user asks what flows or subflows are available, or before
+    triggering a subflow to confirm the name. Returns the trigger_name for each subflow —
+    this is the value to pass to trigger_subflow as subflow_name.
+
+    Note: only SUBFLOWS are listed, not flows. Subflows have no trigger and are designed
+    for programmatic execution. Flows require an event trigger and cannot be triggered
+    via NowLink. If a user asks to trigger a "flow" by name, check this list first —
+    it may be implemented as a subflow.
+
+    Returns a list of subflows, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the subflow does
+        trigger_name: the value to pass to trigger_subflow (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        subflows = client_list_subflows()
+        log_tool_call("list_subflows", params, f"{len(subflows)} subflows returned")
+        return {"count": len(subflows), "subflows": subflows}
+    except Exception as e:
+        log_error("list_subflows", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by name with input variables.
+
+    subflow_name must be in 'scope.internal_name' format — use list_subflows first
+    to find the correct trigger_name. Example: 'global.nowlink_test_subflow'.
+
+    inputs is a dict of input variable names to values. The keys must match the
+    subflow's declared input variable names exactly. Check the subflow in Flow
+    Designer if unsure of the input names.
+
+    The subflow runs asynchronously in the background. This tool returns immediately
+    with an execution_id — it does NOT wait for the subflow to complete. Call
+    get_flow_status with the execution_id to check whether it completed successfully.
+
+    IMPORTANT: Always call list_subflows first if you are not certain of the exact
+    subflow_name. A wrong name returns an error immediately.
+
+    Returns:
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+
+    If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
+    in their terminal first.
+    """
+    params = {"subflow_name": subflow_name, "inputs": inputs}
+    try:
+        result = client_trigger_subflow(subflow_name, inputs)
+        log_tool_call("trigger_subflow", params, f"triggered — execution_id={result.get('execution_id')}")
+        return result
+    except Exception as e:
+        log_error("trigger_subflow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_flow_status(execution_id: str) -> dict:
+    """
+    Check the execution status of a subflow that was previously triggered.
+
+    execution_id is the value returned by trigger_subflow. Pass it here to find
+    out whether the subflow completed, is still running, or encountered an error.
+
+    Call this a few seconds after trigger_subflow — subflows on PDI typically
+    complete within 2–10 seconds. On production instances they are faster.
+
+    Returns:
+        state:             'Complete', 'Running', 'Error', or 'Cancelled'
+        name:              subflow display name
+        fault_description: error detail if state is Error, otherwise empty
+        output_vars:       output variable values if state is Complete
+
+    If state is 'Running', tell the user the subflow is still executing and offer
+    to check again. Do not call this tool in a loop automatically — always wait
+    for the user to ask for a status update.
+    """
+    params = {"execution_id": execution_id}
+    try:
+        result = client_get_flow_status(execution_id)
+        log_tool_call("get_flow_status", params, f"state={result.get('state')}")
+        return result
+    except Exception as e:
+        log_error("get_flow_status", params, str(e))
+        return {"error": str(e)}
+
+
 # ── bulk_execute ──────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -574,7 +870,7 @@ def bulk_execute(
     Only call this tool when the user has explicitly confirmed they want to proceed
     after seeing the bulk_preview results. Explicit confirmation means the user
     has said "yes", "execute", "go ahead", "do it" or similar in response to
-    the preview. A general request like "bulk update all incidents" is NOT
+    the preview. A roadmap request like "bulk update all incidents" is NOT
     confirmation — you must show the preview first and wait for approval.
 
     Parameters:
@@ -670,6 +966,104 @@ def bulk_execute(
         return {"error": str(e)}
 
 
+# ── Flow tools ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_subflows() -> dict:
+    """
+    List all active, published Flow Designer subflows available on this ServiceNow instance.
+
+    Use this tool when the user asks what flows or subflows are available, or before
+    triggering a subflow to confirm the name. Returns the trigger_name for each subflow —
+    this is the value to pass to trigger_subflow as subflow_name.
+
+    Note: only SUBFLOWS are listed, not flows. Subflows have no trigger and are designed
+    for programmatic execution. Flows require an event trigger and cannot be triggered
+    via NowLink. If a user asks to trigger a "flow" by name, check this list first —
+    it may be implemented as a subflow.
+
+    Returns a list of subflows, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the subflow does
+        trigger_name: the value to pass to trigger_subflow (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        subflows = client_list_subflows()
+        log_tool_call("list_subflows", params, f"{len(subflows)} subflows returned")
+        return {"count": len(subflows), "subflows": subflows}
+    except Exception as e:
+        log_error("list_subflows", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by name with input variables.
+
+    subflow_name must be in 'scope.internal_name' format — use list_subflows first
+    to find the correct trigger_name. Example: 'global.nowlink_test_subflow'.
+
+    inputs is a dict of input variable names to values. The keys must match the
+    subflow's declared input variable names exactly. Check the subflow in Flow
+    Designer if unsure of the input names.
+
+    The subflow runs asynchronously in the background. This tool returns immediately
+    with an execution_id — it does NOT wait for the subflow to complete. Call
+    get_flow_status with the execution_id to check whether it completed successfully.
+
+    IMPORTANT: Always call list_subflows first if you are not certain of the exact
+    subflow_name. A wrong name returns an error immediately.
+
+    Returns:
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+
+    If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
+    in their terminal first.
+    """
+    params = {"subflow_name": subflow_name, "inputs": inputs}
+    try:
+        result = client_trigger_subflow(subflow_name, inputs)
+        log_tool_call("trigger_subflow", params, f"triggered — execution_id={result.get('execution_id')}")
+        return result
+    except Exception as e:
+        log_error("trigger_subflow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_flow_status(execution_id: str) -> dict:
+    """
+    Check the execution status of a subflow that was previously triggered.
+
+    execution_id is the value returned by trigger_subflow. Pass it here to find
+    out whether the subflow completed, is still running, or encountered an error.
+
+    Call this a few seconds after trigger_subflow — subflows on PDI typically
+    complete within 2–10 seconds. On production instances they are faster.
+
+    Returns:
+        state:             'Complete', 'Running', 'Error', or 'Cancelled'
+        name:              subflow display name
+        fault_description: error detail if state is Error, otherwise empty
+        output_vars:       output variable values if state is Complete
+
+    If state is 'Running', tell the user the subflow is still executing and offer
+    to check again. Do not call this tool in a loop automatically — always wait
+    for the user to ask for a status update.
+    """
+    params = {"execution_id": execution_id}
+    try:
+        result = client_get_flow_status(execution_id)
+        log_tool_call("get_flow_status", params, f"state={result.get('state')}")
+        return result
+    except Exception as e:
+        log_error("get_flow_status", params, str(e))
+        return {"error": str(e)}
+
+
 # ── get_write_log ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -744,4 +1138,102 @@ def get_write_log(
 
     except Exception as e:
         log_error("get_write_log", params, str(e))
+        return {"error": str(e)}
+
+
+# ── Flow tools ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_subflows() -> dict:
+    """
+    List all active, published Flow Designer subflows available on this ServiceNow instance.
+
+    Use this tool when the user asks what flows or subflows are available, or before
+    triggering a subflow to confirm the name. Returns the trigger_name for each subflow —
+    this is the value to pass to trigger_subflow as subflow_name.
+
+    Note: only SUBFLOWS are listed, not flows. Subflows have no trigger and are designed
+    for programmatic execution. Flows require an event trigger and cannot be triggered
+    via NowLink. If a user asks to trigger a "flow" by name, check this list first —
+    it may be implemented as a subflow.
+
+    Returns a list of subflows, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the subflow does
+        trigger_name: the value to pass to trigger_subflow (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        subflows = client_list_subflows()
+        log_tool_call("list_subflows", params, f"{len(subflows)} subflows returned")
+        return {"count": len(subflows), "subflows": subflows}
+    except Exception as e:
+        log_error("list_subflows", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by name with input variables.
+
+    subflow_name must be in 'scope.internal_name' format — use list_subflows first
+    to find the correct trigger_name. Example: 'global.nowlink_test_subflow'.
+
+    inputs is a dict of input variable names to values. The keys must match the
+    subflow's declared input variable names exactly. Check the subflow in Flow
+    Designer if unsure of the input names.
+
+    The subflow runs asynchronously in the background. This tool returns immediately
+    with an execution_id — it does NOT wait for the subflow to complete. Call
+    get_flow_status with the execution_id to check whether it completed successfully.
+
+    IMPORTANT: Always call list_subflows first if you are not certain of the exact
+    subflow_name. A wrong name returns an error immediately.
+
+    Returns:
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+
+    If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
+    in their terminal first.
+    """
+    params = {"subflow_name": subflow_name, "inputs": inputs}
+    try:
+        result = client_trigger_subflow(subflow_name, inputs)
+        log_tool_call("trigger_subflow", params, f"triggered — execution_id={result.get('execution_id')}")
+        return result
+    except Exception as e:
+        log_error("trigger_subflow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_flow_status(execution_id: str) -> dict:
+    """
+    Check the execution status of a subflow that was previously triggered.
+
+    execution_id is the value returned by trigger_subflow. Pass it here to find
+    out whether the subflow completed, is still running, or encountered an error.
+
+    Call this a few seconds after trigger_subflow — subflows on PDI typically
+    complete within 2–10 seconds. On production instances they are faster.
+
+    Returns:
+        state:             'Complete', 'Running', 'Error', or 'Cancelled'
+        name:              subflow display name
+        fault_description: error detail if state is Error, otherwise empty
+        output_vars:       output variable values if state is Complete
+
+    If state is 'Running', tell the user the subflow is still executing and offer
+    to check again. Do not call this tool in a loop automatically — always wait
+    for the user to ask for a status update.
+    """
+    params = {"execution_id": execution_id}
+    try:
+        result = client_get_flow_status(execution_id)
+        log_tool_call("get_flow_status", params, f"state={result.get('state')}")
+        return result
+    except Exception as e:
+        log_error("get_flow_status", params, str(e))
         return {"error": str(e)}

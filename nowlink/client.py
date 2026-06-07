@@ -546,6 +546,430 @@ def bulk_query(table: str, sysparm_query: str) -> tuple[int, list[dict]]:
     return total_count, sample_records
 
 
+# ── Flow Bridge ───────────────────────────────────────────────────────────────
+
+# The Scripted REST API that NowLink creates on the instance to bridge HTTP
+# calls into ServiceNow's server-side FlowAPI. Without this bridge there is
+# no way to trigger a Flow Designer subflow from outside ServiceNow via REST.
+#
+# Created once via `nowlink setup-flows`. Idempotent — safe to run again.
+
+BRIDGE_SERVICE_ID = "nowlink_flow_bridge"
+BRIDGE_NAMESPACE = "x_nowlink"
+
+_BRIDGE_SUBFLOW_SCRIPT = r"""(function process(/*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    var body = request.body.data;
+    var subflowName = body.subflow_name;
+    var inputs = body.inputs || {};
+
+    if (!subflowName) {
+        response.setStatus(400);
+        response.setBody({ error: 'subflow_name is required' });
+        return;
+    }
+
+    try {
+        var runner = sn_fd.FlowAPI.getRunner()
+            .subflow(subflowName)
+            .inBackground()
+            .withInputs(inputs)
+            .run();
+
+        var executionId = null;
+        if (runner && typeof runner.getExecutionId === 'function') {
+            executionId = runner.getExecutionId();
+        } else if (runner && typeof runner.getContextId === 'function') {
+            executionId = runner.getContextId();
+        }
+
+        response.setStatus(200);
+        response.setBody({
+            status: 'triggered',
+            subflow_name: subflowName,
+            execution_id: executionId,
+        });
+    } catch (e) {
+        response.setStatus(500);
+        response.setBody({ error: e.message || String(e) });
+    }
+})(request, response);"""
+
+_BRIDGE_FLOW_SCRIPT = r"""(function process(/*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    var body = request.body.data;
+    var flowName = body.flow_name;
+    var tableName = body.table_name;
+    var sysId = body.sys_id;
+
+    if (!flowName) {
+        response.setStatus(400);
+        response.setBody({ error: 'flow_name is required' });
+        return;
+    }
+
+    try {
+        var inputs = {};
+        if (tableName && sysId) {
+            var gr = new GlideRecord(tableName);
+            if (gr.get(sysId)) {
+                inputs['current'] = gr;
+                inputs['table_name'] = tableName;
+            } else {
+                response.setStatus(404);
+                response.setBody({ error: 'Record not found: ' + tableName + '/' + sysId });
+                return;
+            }
+        }
+
+        var runner = sn_fd.FlowAPI.getRunner()
+            .flow(flowName)
+            .inBackground()
+            .withInputs(inputs)
+            .run();
+
+        var executionId = null;
+        if (runner && typeof runner.getExecutionId === 'function') {
+            executionId = runner.getExecutionId();
+        } else if (runner && typeof runner.getContextId === 'function') {
+            executionId = runner.getContextId();
+        }
+
+        response.setStatus(200);
+        response.setBody({
+            status: 'triggered',
+            flow_name: flowName,
+            execution_id: executionId,
+        });
+    } catch (e) {
+        response.setStatus(500);
+        response.setBody({ error: e.message || String(e) });
+    }
+})(request, response);"""
+
+_BRIDGE_ACTION_SCRIPT = r"""(function process(/*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    var body = request.body.data;
+    var actionName = body.action_name;
+    var inputs = body.inputs || {};
+
+    if (!actionName) {
+        response.setStatus(400);
+        response.setBody({ error: 'action_name is required' });
+        return;
+    }
+
+    try {
+        var runner = sn_fd.FlowAPI.getRunner()
+            .action(actionName)
+            .inBackground()
+            .withInputs(inputs)
+            .run();
+
+        var executionId = null;
+        if (runner && typeof runner.getExecutionId === 'function') {
+            executionId = runner.getExecutionId();
+        } else if (runner && typeof runner.getContextId === 'function') {
+            executionId = runner.getContextId();
+        }
+
+        response.setStatus(200);
+        response.setBody({
+            status: 'triggered',
+            action_name: actionName,
+            execution_id: executionId,
+        });
+    } catch (e) {
+        response.setStatus(500);
+        response.setBody({ error: e.message || String(e) });
+    }
+})(request, response);"""
+
+_BRIDGE_OPERATIONS = [
+    {
+        "name": "Trigger Subflow",
+        "relative_path": "/trigger-subflow",
+        "script": _BRIDGE_SUBFLOW_SCRIPT,
+        "description": "Trigger a Flow Designer subflow by name with inputs.",
+    },
+    {
+        "name": "Trigger Flow",
+        "relative_path": "/trigger-flow",
+        "script": _BRIDGE_FLOW_SCRIPT,
+        "description": "Trigger a Flow Designer flow by name with an optional record context.",
+    },
+    {
+        "name": "Trigger Action",
+        "relative_path": "/trigger-action",
+        "script": _BRIDGE_ACTION_SCRIPT,
+        "description": "Trigger a Flow Designer action by name with inputs.",
+    },
+]
+
+
+def setup_flow_bridge() -> dict:
+    """
+    Create the NowLink Flow Bridge Scripted REST API on the instance if it does
+    not already exist. Idempotent — safe to call on every `nowlink setup-flows`.
+
+    Creates three endpoints under /api/x_nowlink/nowlink_flow_bridge/:
+        POST /trigger-subflow  — trigger a subflow by scope.internal_name + inputs
+        POST /trigger-flow     — trigger a flow by scope.internal_name + record context
+        POST /trigger-action   — trigger an action by scope.internal_name + inputs
+
+    All three call sn_fd.FlowAPI server-side and return an execution_id.
+    Requires nowlink.dev to have the web_service_admin role.
+
+    Returns a dict with keys:
+        created: bool  — True if any new records were created, False if fully installed
+        bridge_url: str — base URL of the bridge
+        message: str
+    """
+    base_url = _get_base_url()
+    bridge_url = f"{base_url}/api/{BRIDGE_NAMESPACE}/{BRIDGE_SERVICE_ID}"
+
+    with httpx.Client(verify=False) as client:
+
+        # ── Step 1: check if definition exists ────────────────────────────────
+        r = client.get(
+            f"{base_url}/api/now/table/sys_ws_definition",
+            headers=_auth_headers(),
+            params={
+                "sysparm_query": f"service_id={BRIDGE_SERVICE_ID}",
+                "sysparm_fields": "sys_id,name",
+                "sysparm_limit": "1",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        existing = _handle_response(r, "check flow bridge definition").get("result", [])
+
+        if existing:
+            defn_sys_id = existing[0]["sys_id"]
+        else:
+            # ── Step 2: create the definition ─────────────────────────────────
+            defn_sys_id = None
+            try:
+                r2 = client.post(
+                    f"{base_url}/api/now/table/sys_ws_definition",
+                    headers=_auth_headers(),
+                    json={
+                        "name": "NowLink Flow Bridge",
+                        "service_id": BRIDGE_SERVICE_ID,
+                        "namespace": BRIDGE_NAMESPACE,
+                        "is_active": "true",
+                        "short_description": "NowLink bridge for triggering Flow Designer subflows, flows, and actions via REST.",
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                defn = _handle_response(r2, "create flow bridge definition").get("result", {})
+                defn_sys_id = defn.get("sys_id")
+            except httpx.TimeoutException:
+                with httpx.Client(verify=False) as verify_client:
+                    r_check = verify_client.get(
+                        f"{base_url}/api/now/table/sys_ws_definition",
+                        headers=_auth_headers(),
+                        params={
+                            "sysparm_query": f"service_id={BRIDGE_SERVICE_ID}",
+                            "sysparm_fields": "sys_id",
+                            "sysparm_limit": "1",
+                        },
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    found = _handle_response(r_check, "post-timeout check for bridge definition").get("result", [])
+                    if not found:
+                        raise RuntimeError(
+                            "ServiceNow did not respond in time and the flow bridge definition "
+                            "was not created. Run `nowlink setup-flows` again to retry."
+                        )
+                    defn_sys_id = found[0]["sys_id"]
+
+            if not defn_sys_id:
+                raise RuntimeError("Flow bridge definition created but no sys_id returned.")
+
+        # ── Step 3: check existing operations and create any missing ──────────
+        r_ops = client.get(
+            f"{base_url}/api/now/table/sys_ws_operation",
+            headers=_auth_headers(),
+            params={
+                "sysparm_query": f"web_service_definition={defn_sys_id}",
+                "sysparm_fields": "relative_path",
+                "sysparm_limit": "10",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        existing_paths = {
+            op["relative_path"]
+            for op in _handle_response(r_ops, "list bridge operations").get("result", [])
+        }
+
+        # Return early if all operations already exist
+        needed = [op for op in _BRIDGE_OPERATIONS if op["relative_path"] not in existing_paths]
+        if not needed:
+            return {
+                "created": False,
+                "bridge_url": bridge_url,
+                "message": "Flow bridge already installed.",
+            }
+
+        # Create missing operations
+        for op in needed:
+            try:
+                r3 = client.post(
+                    f"{base_url}/api/now/table/sys_ws_operation",
+                    headers=_auth_headers(),
+                    json={
+                        "web_service_definition": defn_sys_id,
+                        "name": op["name"],
+                        "http_method": "POST",
+                        "relative_path": op["relative_path"],
+                        "operation_script": op["script"],
+                        "requires_acl_authorization": "false",
+                        "requires_authentication": "true",
+                        "short_description": op["description"],
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                _handle_response(r3, f"create bridge operation {op['relative_path']}")
+            except httpx.TimeoutException:
+                with httpx.Client(verify=False) as verify_client:
+                    r_verify = verify_client.get(
+                        f"{base_url}/api/now/table/sys_ws_operation",
+                        headers=_auth_headers(),
+                        params={
+                            "sysparm_query": f"web_service_definition={defn_sys_id}^relative_path={op['relative_path']}",
+                            "sysparm_fields": "sys_id",
+                            "sysparm_limit": "1",
+                        },
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    if not _handle_response(r_verify, f"post-timeout check for {op['relative_path']}").get("result", []):
+                        raise RuntimeError(
+                            f"ServiceNow did not respond in time and bridge operation {op['relative_path']} "
+                            "was not created. Run `nowlink setup-flows` again to retry."
+                        )
+
+        return {
+            "created": True,
+            "bridge_url": bridge_url,
+            "message": f"Flow bridge installed successfully ({len(needed)} operation(s) created).",
+        }
+
+
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by its internal name via the NowLink Flow Bridge.
+
+    subflow_name must be in the format 'scope.internal_name', e.g.:
+        'global.nowlink_test_subflow'
+        'x_myapp.onboarding_subflow'
+
+    inputs is a dict of input variable names to values matching the subflow's
+    declared input variables. Passing unexpected keys is harmless — ServiceNow
+    ignores them. Missing required inputs will cause the subflow to fail at runtime.
+
+    Returns:
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+
+    execution_id is the sys_id of the sys_flow_context record. Pass it to
+    get_flow_status() to check whether the subflow completed successfully.
+
+    Raises RuntimeError if the bridge is not installed (run `nowlink setup-flows`)
+    or if FlowAPI cannot find a subflow with the given name.
+    """
+    base_url = _get_base_url()
+    bridge_url = f"{base_url}/api/{BRIDGE_NAMESPACE}/{BRIDGE_SERVICE_ID}/trigger-subflow"
+
+    with httpx.Client(verify=False) as client:
+        r = client.post(
+            bridge_url,
+            headers=_auth_headers(),
+            json={"subflow_name": subflow_name, "inputs": inputs},
+            timeout=REQUEST_TIMEOUT,
+        )
+
+    data = _handle_response(r, f"trigger subflow {subflow_name}")
+    result = data.get("result", {})
+
+    if "error" in result:
+        raise RuntimeError(f"FlowAPI error triggering '{subflow_name}': {result['error']}")
+
+    return result
+
+
+def get_flow_status(execution_id: str) -> dict:
+    """
+    Check the execution status of a subflow via its sys_flow_context sys_id.
+
+    execution_id is the value returned by trigger_subflow().
+
+    Returns a dict with:
+        sys_id:            the execution context sys_id
+        name:              subflow display name
+        state:             'Complete', 'Running', 'Error', 'Cancelled'
+        fault_description: error detail if state is 'Error', else empty string
+        output_vars:       output variable values if state is 'Complete'
+
+    Subflows run asynchronously. If state is 'Running', call again after a short
+    delay. On PDI, simple subflows typically complete within 2–5 seconds.
+    """
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_flow_context/{execution_id}",
+            headers=_auth_headers(),
+            params={
+                "sysparm_display_value": "true",
+                "sysparm_fields": "sys_id,name,state,fault_description,error_message,output_vars",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, f"get flow status for {execution_id}")
+    result = data.get("result", {})
+    if not result:
+        raise RuntimeError(f"No flow context found for execution_id={execution_id}")
+    return result
+
+
+def list_subflows() -> list[dict]:
+    """
+    Return all active, published Flow Designer subflows visible to nowlink.dev.
+
+    Queries sys_hub_flow filtered to type=subflow — subflows only, not flows.
+    Flows require an event trigger and cannot be called via FlowAPI from outside
+    ServiceNow. Subflows have no trigger and are the correct unit for programmatic
+    execution. Note: both flows and subflows share the sys_hub_flow table —
+    the type field distinguishes them.
+
+    Returns a list of dicts with name, sys_id, description, and internal_name.
+    internal_name is the value to pass to trigger_subflow() as subflow_name,
+    formatted as 'scope.internal_name'.
+    """
+    params = {
+        "sysparm_query": "active=true^status=published^type=subflow^ORDERBYDESCsys_updated_on",
+        "sysparm_fields": "name,sys_id,description,internal_name,sys_scope.name",
+        "sysparm_limit": "50",
+        "sysparm_display_value": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_hub_flow",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, "list subflows")
+    results = data.get("result", [])
+
+    subflows = []
+    for rec in results:
+        scope = rec.get("sys_scope.name", "global")
+        internal = rec.get("internal_name", "")
+        subflows.append({
+            "name": rec.get("name", ""),
+            "sys_id": rec.get("sys_id", ""),
+            "description": rec.get("description", ""),
+            "internal_name": internal,
+            "trigger_name": f"{scope}.{internal}" if internal else None,
+        })
+    return subflows
+
+
 def describe_table(table: str) -> list[dict]:
     params = {
         "sysparm_query": f"name={table}^element!=NULL^active=true",
