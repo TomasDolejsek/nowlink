@@ -970,6 +970,354 @@ def list_subflows() -> list[dict]:
     return subflows
 
 
+def get_action_inputs(action_name: str) -> list[dict]:
+    """
+    Return the declared input variables for a Flow Designer action by parsing
+    the label_cache field on sys_hub_action_type_definition.
+
+    action_name is in 'scope.internal_name' format, e.g.:
+        'global.delete_related_entry_cis_for_task'
+
+    Requires nowlink.dev to have the flow_designer role — sys_hub_action_type_definition
+    is gated by a row-level ACL that allows only flow_designer and admin. This is
+    different from subflows (sys_hub_flow is readable with rest_service).
+
+    Action inputs are identified in label_cache by type == "action" and name format
+    {{action.variable_name}}. Only top-level inputs are returned — nested paths like
+    {{action.texts.Text}} are sub-elements of structured inputs and are excluded.
+    Inputs with empty names ({{action._}}) are also excluded.
+
+    Returns a list of dicts, one per top-level input:
+      [{"name": "task", "label": "Task", "type": "reference", "base_type": "reference"}]
+
+    Returns [] if the action has no inputs or label_cache is missing/unparseable.
+    Raises RuntimeError if the action cannot be found.
+    """
+    import json as _json
+    import re
+
+    if "." not in action_name:
+        raise RuntimeError(
+            f"Invalid action_name format '{action_name}'. "
+            "Expected 'scope.internal_name', e.g. 'global.delete_related_entry_cis_for_task'."
+        )
+    scope_name, internal_name = action_name.split(".", 1)
+
+    params = {
+        "sysparm_query": f"internal_name={internal_name}^active=true^state=published",
+        "sysparm_fields": "sys_id,name,internal_name,label_cache,sys_scope.name",
+        "sysparm_limit": "1",
+        "sysparm_display_value": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_hub_action_type_definition",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, f"get_action_inputs for {action_name}")
+    results = data.get("result", [])
+
+    if not results:
+        raise RuntimeError(
+            f"Action '{action_name}' not found. "
+            "Use list_actions to see available actions and their trigger_names."
+        )
+
+    label_cache_raw = results[0].get("label_cache", "")
+    if not label_cache_raw:
+        return []
+
+    try:
+        all_vars = _json.loads(label_cache_raw)
+    except (_json.JSONDecodeError, TypeError):
+        return []
+
+    inputs = []
+    seen_names = set()
+    for var in all_vars:
+        if var.get("type") != "action":
+            continue  # skip step outputs
+
+        raw_name = var.get("name", "")
+        # Extract variable name from {{action.X}} — must match exactly
+        match = re.match(r"^\{\{action\.([^}]+)\}\}$", raw_name)
+        if not match:
+            continue
+
+        var_name = match.group(1)
+
+        # Skip empty names and nested paths (contain a dot)
+        if not var_name or var_name == "_" or "." in var_name:
+            continue
+
+        # Deduplicate — some actions have case variants of the same name
+        if var_name.lower() in seen_names:
+            continue
+        seen_names.add(var_name.lower())
+
+        label_raw = var.get("label", "")
+        # label format is "action➛Display Name" — strip the prefix
+        label = label_raw.split("➛", 1)[-1].strip() if "➛" in label_raw else label_raw
+
+        entry = {
+            "name": var_name,
+            "label": label,
+            "type": var.get("base_type", "string"),
+        }
+
+        choices = var.get("choices")
+        if choices:
+            entry["choices"] = [{"label": c["label"], "value": c["value"]} for c in choices]
+
+        inputs.append(entry)
+
+    return inputs
+
+
+def list_actions(limit: int = 50) -> list[dict]:
+    """
+    Return active, published Flow Designer actions visible to nowlink.dev.
+
+    Requires nowlink.dev to have the flow_designer role.
+
+    Excludes Integration Hub actions (ih_action=true) — those require paid
+    Integration Hub Enterprise and are not triggerable on standard PDIs.
+
+    Returns a list of dicts with name, sys_id, description, internal_name,
+    category, and trigger_name (scope.internal_name format).
+    """
+    params = {
+        "sysparm_query": "active=true^state=published^ih_action=false^ORDERBYname",
+        "sysparm_fields": "name,sys_id,description,internal_name,category,annotation,sys_scope.name",
+        "sysparm_limit": str(min(limit, 200)),
+        "sysparm_display_value": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_hub_action_type_definition",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, "list_actions")
+    results = data.get("result", [])
+
+    actions = []
+    for rec in results:
+        scope = rec.get("sys_scope.name", "global")
+        internal = rec.get("internal_name", "")
+        description = rec.get("description") or rec.get("annotation") or ""
+        actions.append({
+            "name": rec.get("name", ""),
+            "sys_id": rec.get("sys_id", ""),
+            "description": description,
+            "internal_name": internal,
+            "category": rec.get("category", ""),
+            "trigger_name": f"{scope}.{internal}" if internal else None,
+        })
+    return actions
+
+
+def trigger_action(action_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer action by its internal name via the NowLink Flow Bridge.
+
+    action_name must be in 'scope.internal_name' format, e.g.:
+        'global.delete_related_entry_cis_for_task'
+
+    inputs is a dict of {variable_name: value} matching the action's declared inputs.
+    Use describe_action to find the correct variable names before triggering.
+
+    Returns:
+        {"status": "triggered", "action_name": ..., "execution_id": ...}
+
+    Raises RuntimeError if the bridge is not installed or the action cannot be found.
+    """
+    base_url = _get_base_url()
+    bridge_url = f"{base_url}/api/{BRIDGE_NAMESPACE}/{BRIDGE_SERVICE_ID}/trigger-action"
+
+    with httpx.Client(verify=False) as client:
+        r = client.post(
+            bridge_url,
+            headers=_auth_headers(),
+            json={"action_name": action_name, "inputs": inputs},
+            timeout=REQUEST_TIMEOUT,
+        )
+
+    data = _handle_response(r, f"trigger action {action_name}")
+    result = data.get("result", {})
+
+    if "error" in result:
+        raise RuntimeError(f"FlowAPI error triggering action '{action_name}': {result['error']}")
+
+    return result
+
+
+def list_flows(limit: int = 50) -> list[dict]:
+    """
+    Return all active, published Flow Designer flows visible to nowlink.dev.
+
+    Queries sys_hub_flow filtered to type=flow — flows only, not subflows.
+    Flows are triggered by platform events (record changes, schedules, catalog
+    items) and cannot be called with arbitrary inputs via the REST API.
+    Use list_subflows for programmatically triggerable automation.
+
+    Returns a list of dicts with name, sys_id, description, internal_name,
+    and trigger_name (scope.internal_name format).
+    """
+    params = {
+        "sysparm_query": "active=true^status=published^type=flow^ORDERBYname",
+        "sysparm_fields": "name,sys_id,description,internal_name,sys_scope.name",
+        "sysparm_limit": str(min(limit, 200)),
+        "sysparm_display_value": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_hub_flow",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, "list_flows")
+    results = data.get("result", [])
+
+    flows = []
+    for rec in results:
+        scope = rec.get("sys_scope.name", "global")
+        internal = rec.get("internal_name", "")
+        flows.append({
+            "name": rec.get("name", ""),
+            "sys_id": rec.get("sys_id", ""),
+            "description": rec.get("description", ""),
+            "internal_name": internal,
+            "trigger_name": f"{scope}.{internal}" if internal else None,
+        })
+    return flows
+
+
+def describe_flow(flow_name: str) -> dict:
+    """
+    Return trigger information for a Flow Designer flow.
+
+    flow_name is in 'scope.internal_name' format, e.g.:
+        'global.sla_notification_and_escalation_flow'
+
+    Parses the label_cache field on sys_hub_flow to extract trigger context
+    variables — those with label starting with "Trigger➛". These reveal what
+    platform event fires the flow and what record/table context it expects.
+
+    Returns:
+        {
+            "name": display name,
+            "description": flow description,
+            "trigger_context": [
+                {"name": "task_sla_record", "label": "Task SLA Record",
+                 "type": "reference", "table": "task_sla"},
+                ...
+            ],
+            "can_trigger_via_api": False,
+            "trigger_explanation": "human-readable explanation of what fires this flow"
+        }
+
+    can_trigger_via_api is always False — flows require a platform event trigger.
+    Use list_subflows for programmatically triggerable automation instead.
+    """
+    import json as _json
+
+    if "." not in flow_name:
+        raise RuntimeError(
+            f"Invalid flow_name format '{flow_name}'. "
+            "Expected 'scope.internal_name', e.g. 'global.sla_notification_and_escalation_flow'."
+        )
+    _, internal_name = flow_name.split(".", 1)
+
+    params = {
+        "sysparm_query": f"internal_name={internal_name}^type=flow^active=true",
+        "sysparm_fields": "sys_id,name,description,internal_name,label_cache",
+        "sysparm_limit": "1",
+        "sysparm_display_value": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_hub_flow",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, f"describe_flow for {flow_name}")
+    results = data.get("result", [])
+
+    if not results:
+        raise RuntimeError(
+            f"Flow '{flow_name}' not found. "
+            "Use list_flows to see available flows and their trigger_names."
+        )
+
+    rec = results[0]
+    label_cache_raw = rec.get("label_cache", "")
+
+    trigger_context = []
+    if label_cache_raw:
+        try:
+            all_vars = _json.loads(label_cache_raw)
+            for var in all_vars:
+                label_raw = var.get("label", "")
+                if not label_raw.startswith("Trigger"):
+                    continue
+                if "➛" not in label_raw:
+                    continue
+                # Only top-level trigger vars — label has exactly one ➛
+                # Handles both "Trigger➛Record" and "Trigger - Record Updated➛Record" formats
+                if label_raw.count("➛") != 1:
+                    continue
+                label = label_raw.split("➛", 1)[-1].strip()
+                if not label:
+                    continue
+                entry = {
+                    "name": var.get("name", "").split(".", 1)[-1] if "." in var.get("name", "") else var.get("name", ""),
+                    "label": label,
+                    "type": var.get("base_type", var.get("type", "string")),
+                }
+                if var.get("reference"):
+                    entry["table"] = var["reference"]
+                trigger_context.append(entry)
+        except (_json.JSONDecodeError, TypeError):
+            pass
+
+    # Build a plain-English explanation from the trigger context
+    if trigger_context:
+        tables = list({e["table"] for e in trigger_context if e.get("table")})
+        if tables:
+            explanation = (
+                f"This flow is triggered by a platform event on the {', '.join(tables)} table(s). "
+                "It fires automatically when ServiceNow detects the configured condition "
+                "(record created/updated, schedule, etc.) — it cannot be called directly via API. "
+                "To trigger equivalent logic on demand, rebuild it as a Subflow in Flow Designer."
+            )
+        else:
+            explanation = (
+                "This flow is triggered by a platform event (schedule, application trigger, or similar). "
+                "It cannot be called directly via API. "
+                "To trigger equivalent logic on demand, rebuild it as a Subflow in Flow Designer."
+            )
+    else:
+        explanation = (
+            "Trigger information could not be determined from the flow definition. "
+            "Flows cannot be called directly via API — they require a platform event to fire. "
+            "To trigger equivalent logic on demand, rebuild it as a Subflow in Flow Designer."
+        )
+
+    return {
+        "name": rec.get("name", ""),
+        "description": rec.get("description", ""),
+        "trigger_context": trigger_context,
+        "can_trigger_via_api": False,
+        "trigger_explanation": explanation,
+    }
+
+
 def get_subflow_inputs(subflow_name: str) -> list[dict]:
     """
     Return the declared input variables for a subflow by parsing the label_cache field

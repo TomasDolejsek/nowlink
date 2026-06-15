@@ -64,6 +64,12 @@ class TestServerToolRegistration:
             "describe_subflow",
             "trigger_subflow",
             "get_flow_status",
+            "list_flows",
+            "describe_flow",
+            "trigger_flow",
+            "list_actions",
+            "describe_action",
+            "trigger_action",
             "bulk_preview",
             "bulk_execute",
             "get_write_log",
@@ -72,9 +78,9 @@ class TestServerToolRegistration:
         assert missing == set(), f"Expected tools missing from server.py: {missing}"
 
     def test_tool_count_is_exact(self):
-        """Exactly 13 tools registered — no more, no less (v0.5 baseline)."""
+        """Exactly 19 tools registered — no more, no less (v0.5 baseline)."""
         names = _get_tool_decorated_function_names()
-        assert len(names) == 13, (
-            f"Expected 13 registered tools, found {len(names)}: {names}. "
+        assert len(names) == 19, (
+            f"Expected 19 registered tools, found {len(names)}: {names}. "
             "Update this test when adding new tools in v0.6."
         )

@@ -10,7 +10,10 @@ from nowlink.client import query_records, get_record_by_number, get_record_by_sy
     bulk_fetch_sys_ids, bulk_update as client_bulk_update, \
     setup_flow_bridge as client_setup_flow_bridge, trigger_subflow as client_trigger_subflow, \
     get_flow_status as client_get_flow_status, list_subflows as client_list_subflows, \
-    get_subflow_inputs as client_get_subflow_inputs
+    get_subflow_inputs as client_get_subflow_inputs, \
+    list_actions as client_list_actions, get_action_inputs as client_get_action_inputs, \
+    trigger_action as client_trigger_action, \
+    list_flows as client_list_flows, describe_flow as client_describe_flow
 from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
 from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
@@ -629,6 +632,265 @@ def get_flow_status(execution_id: str) -> dict:
         return result
     except Exception as e:
         log_error("get_flow_status", params, str(e))
+        return {"error": str(e)}
+
+
+# ── Flow tools (Flows — discovery only) ───────────────────────────────────────
+
+@mcp.tool()
+def list_flows() -> dict:
+    """
+    List all active, published Flow Designer flows on this ServiceNow instance.
+
+    Use this tool when the user asks what flows exist or wants to find a specific
+    flow by name. Returns the trigger_name for each flow for use with describe_flow.
+
+    IMPORTANT: Flows CANNOT be triggered via NowLink. They are fired by platform
+    events (record changes, schedules, catalog submissions) not by API calls.
+    If the user wants to trigger automation on demand, check list_subflows instead —
+    subflows are designed for programmatic execution.
+
+    Returns a list of flows, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the flow does
+        trigger_name: use this with describe_flow (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        flows = client_list_flows()
+        log_tool_call("list_flows", params, f"{len(flows)} flows returned")
+        return {"count": len(flows), "flows": flows}
+    except Exception as e:
+        log_error("list_flows", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def describe_flow(flow_name: str) -> dict:
+    """
+    Describe a Flow Designer flow — what triggers it and what context it expects.
+
+    Use this tool when the user asks how a flow works, what fires it, or why
+    it cannot be triggered directly. Returns the trigger context (what record/table
+    the flow expects) and a plain-English explanation of what fires the flow.
+
+    flow_name must be in 'scope.internal_name' format — use list_flows first
+    to find the correct trigger_name. Example: 'global.sla_notification_and_escalation_flow'.
+
+    Returns:
+        name:               display name
+        description:        what the flow does
+        trigger_context:    list of trigger variables (record, table, event context)
+        can_trigger_via_api: always False — flows require a platform event
+        trigger_explanation: plain-English description of what fires this flow
+                             and what a user would need to do to trigger equivalent
+                             logic on demand (rebuild as a Subflow).
+    """
+    params = {"flow_name": flow_name}
+    try:
+        result = client_describe_flow(flow_name)
+        log_tool_call("describe_flow", params, f"trigger context: {len(result.get('trigger_context', []))} variables")
+        return result
+    except Exception as e:
+        log_error("describe_flow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_flow(flow_name: str) -> dict:
+    """
+    Explain why a Flow Designer flow cannot be triggered via NowLink and what to do instead.
+
+    This tool does NOT trigger the flow. Flows are fired by platform events
+    (record created/updated, scheduled, catalog submission, etc.) and cannot be
+    called directly via the REST API without Integration Hub Enterprise.
+
+    Use this tool when the user asks to trigger a flow and you need to explain
+    why it cannot be done and what the alternatives are. This tool will:
+    1. Look up the flow's trigger type and context
+    2. Explain what platform event fires it
+    3. Suggest alternatives (rebuild as Subflow, or trigger the underlying condition)
+
+    If the user wants to trigger automation on demand, suggest list_subflows —
+    subflows are designed for programmatic execution and work with trigger_subflow.
+
+    flow_name must be in 'scope.internal_name' format.
+    Example: 'global.sla_notification_and_escalation_flow'
+    """
+    params = {"flow_name": flow_name}
+    try:
+        flow_info = client_describe_flow(flow_name)
+        log_tool_call("trigger_flow", params, "returned trigger explanation (no execution)")
+        return {
+            "triggered": False,
+            "reason": "Flows cannot be triggered via API — they require a platform event.",
+            "flow_name": flow_info.get("name", flow_name),
+            "trigger_explanation": flow_info.get("trigger_explanation", ""),
+            "trigger_context": flow_info.get("trigger_context", []),
+            "alternatives": (
+                "To run this logic on demand: (1) rebuild it as a Subflow in Flow Designer "
+                "and call it with trigger_subflow, or (2) create the platform condition that "
+                "fires this flow naturally (e.g. update the relevant record)."
+            ),
+        }
+    except Exception as e:
+        log_error("trigger_flow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def list_actions() -> dict:
+    """
+    List active, published Flow Designer actions available on this ServiceNow instance.
+
+    Use this tool when the user asks what actions are available, or before triggering
+    an action to confirm the name. Returns the trigger_name for each action — this is
+    the value to pass to trigger_action as action_name.
+
+    Note: Integration Hub actions (requiring paid IH Enterprise) are excluded.
+    Only standard platform actions are listed.
+
+    Requires the flow_designer role on the integration user. If this tool returns
+    an access denied error, tell the user to grant flow_designer to nowlink.dev.
+
+    Returns a list of actions, each with:
+        name:         display name
+        sys_id:       ServiceNow sys_id
+        description:  what the action does
+        category:     action category (e.g. "Record", "Notification")
+        trigger_name: the value to pass to trigger_action (format: scope.internal_name)
+    """
+    params = {}
+    try:
+        actions = client_list_actions()
+        log_tool_call("list_actions", params, f"{len(actions)} actions returned")
+        return {"count": len(actions), "actions": actions}
+    except Exception as e:
+        log_error("list_actions", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def describe_action(action_name: str) -> dict:
+    """
+    Return the declared input variables for a Flow Designer action.
+
+    Call this tool before trigger_action when you are unsure what inputs an action
+    expects. It returns the exact variable names, types, and any valid choices so
+    you can ask the user for the right values before triggering.
+
+    action_name must be in 'scope.internal_name' format — use list_actions first
+    to find the correct trigger_name. Example: 'global.delete_related_entry_cis_for_task'.
+
+    Requires the flow_designer role on the integration user.
+
+    Returns a list of inputs, each with:
+        name:    the key to pass in the inputs dict to trigger_action
+        label:   human-readable display name for the variable
+        type:    data type (string, integer, reference, GUID, choice, ...)
+        choices: list of {label, value} pairs — only present for choice type inputs
+
+    Only top-level inputs are returned. Nested structured inputs (e.g. array sub-fields)
+    are excluded — pass the parent key with a structured value if needed.
+
+    Returns an empty inputs list if the action has no declared inputs.
+    """
+    params = {"action_name": action_name}
+    try:
+        inputs = client_get_action_inputs(action_name)
+        log_tool_call("describe_action", params, f"{len(inputs)} inputs returned for {action_name}")
+        return {
+            "action_name": action_name,
+            "input_count": len(inputs),
+            "inputs": inputs,
+            "message": (
+                f"This action expects {len(inputs)} input(s). "
+                "Pass these as the inputs dict to trigger_action."
+                if inputs else
+                "This action has no declared inputs. Call trigger_action with an empty inputs dict: {}"
+            ),
+        }
+    except Exception as e:
+        log_error("describe_action", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_action(action_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer action by name with input variables.
+
+    RECOMMENDED WORKFLOW:
+      1. Call list_actions to confirm the trigger_name
+      2. Call describe_action to see what inputs are expected and their types
+      3. Collect any missing inputs from the user
+      4. Call trigger_action with the correct input names and values
+
+    action_name must be in 'scope.internal_name' format.
+    Example: 'global.delete_related_entry_cis_for_task'
+
+    inputs is a dict of {variable_name: value}. Use describe_action to find
+    the correct variable names before triggering.
+
+    This tool validates inputs against the action's declared variables before
+    triggering — unknown keys generate a warning, missing declared inputs also
+    generate a warning. The action is still triggered even with warnings.
+
+    The action runs asynchronously. This tool returns immediately with an
+    execution_id. Call get_flow_status to check whether it completed.
+
+    Requires the flow_designer role on the integration user.
+
+    Returns:
+        {"status": "triggered", "action_name": ..., "execution_id": ...,
+         "warnings": [...]}  # warnings only present if input issues detected
+
+    If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
+    in their terminal first.
+    """
+    params = {"action_name": action_name, "inputs": inputs}
+    try:
+        warnings = []
+        try:
+            declared = client_get_action_inputs(action_name)
+            declared_names = {i["name"] for i in declared}
+
+            if declared:
+                provided_names = set(inputs.keys())
+                unknown = provided_names - declared_names
+                missing = declared_names - provided_names
+                if unknown:
+                    warnings.append(
+                        f"Unrecognised input(s) provided (will be ignored): "
+                        f"{', '.join(sorted(unknown))}. "
+                        f"Declared inputs are: {', '.join(sorted(declared_names))}."
+                    )
+                if missing:
+                    warnings.append(
+                        f"Declared input(s) not provided: {', '.join(sorted(missing))}. "
+                        "If these are required, the action may fail. "
+                        "Call describe_action to review expected inputs."
+                    )
+        except Exception:
+            warnings.append(
+                "Could not retrieve declared inputs for validation. "
+                "Triggering with provided inputs as-is."
+            )
+
+        result = client_trigger_action(action_name, inputs)
+        log_tool_call(
+            "trigger_action", params,
+            f"triggered — execution_id={result.get('execution_id')}"
+            + (f", {len(warnings)} warning(s)" if warnings else "")
+        )
+
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    except Exception as e:
+        log_error("trigger_action", params, str(e))
         return {"error": str(e)}
 
 
