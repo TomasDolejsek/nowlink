@@ -51,7 +51,7 @@ class TestServerToolRegistration:
         )
 
     def test_expected_tools_are_registered(self):
-        """All v0.4 tools must be present."""
+        """All v0.5 tools must be present."""
         names = set(_get_tool_decorated_function_names())
         expected = {
             "ping",
@@ -61,6 +61,7 @@ class TestServerToolRegistration:
             "create_record",
             "update_record",
             "list_subflows",
+            "describe_subflow",
             "trigger_subflow",
             "get_flow_status",
             "bulk_preview",
@@ -71,9 +72,9 @@ class TestServerToolRegistration:
         assert missing == set(), f"Expected tools missing from server.py: {missing}"
 
     def test_tool_count_is_exact(self):
-        """Exactly 12 tools registered — no more, no less (v0.4 baseline)."""
+        """Exactly 13 tools registered — no more, no less (v0.5 baseline)."""
         names = _get_tool_decorated_function_names()
-        assert len(names) == 12, (
-            f"Expected 12 registered tools, found {len(names)}: {names}. "
-            "Update this test when adding new tools in v0.5."
+        assert len(names) == 13, (
+            f"Expected 13 registered tools, found {len(names)}: {names}. "
+            "Update this test when adding new tools in v0.6."
         )

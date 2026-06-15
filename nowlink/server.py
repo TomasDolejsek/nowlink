@@ -9,7 +9,8 @@ from nowlink.client import query_records, get_record_by_number, get_record_by_sy
     update_record as client_update, get_mandatory_fields, bulk_query as client_bulk_query, \
     bulk_fetch_sys_ids, bulk_update as client_bulk_update, \
     setup_flow_bridge as client_setup_flow_bridge, trigger_subflow as client_trigger_subflow, \
-    get_flow_status as client_get_flow_status, list_subflows as client_list_subflows
+    get_flow_status as client_get_flow_status, list_subflows as client_list_subflows, \
+    get_subflow_inputs as client_get_subflow_inputs
 from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
 from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
@@ -474,35 +475,127 @@ def list_subflows() -> dict:
 
 
 @mcp.tool()
-def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+def describe_subflow(subflow_name: str) -> dict:
     """
-    Trigger a Flow Designer subflow by name with input variables.
+    Return the declared input variables for a Flow Designer subflow.
+
+    Call this tool before trigger_subflow when you are unsure what inputs a subflow
+    expects. It returns the exact variable names, types, and valid choices so you can
+    ask the user for the right values before triggering.
 
     subflow_name must be in 'scope.internal_name' format — use list_subflows first
     to find the correct trigger_name. Example: 'global.nowlink_test_subflow'.
 
-    inputs is a dict of input variable names to values. The keys must match the
-    subflow's declared input variable names exactly. Check the subflow in Flow
-    Designer if unsure of the input names.
+    Returns a list of inputs, each with:
+        name:    the key to pass in the inputs dict to trigger_subflow
+        label:   human-readable display name for the variable
+        type:    data type (string, integer, boolean, GUID, choice, reference, ...)
+        choices: list of {label, value} pairs — only present for choice type inputs
 
-    The subflow runs asynchronously in the background. This tool returns immediately
-    with an execution_id — it does NOT wait for the subflow to complete. Call
-    get_flow_status with the execution_id to check whether it completed successfully.
+    There is no mandatory flag available from the ServiceNow API at this access level.
+    Treat all inputs as potentially required unless the subflow description says otherwise.
 
-    IMPORTANT: Always call list_subflows first if you are not certain of the exact
-    subflow_name. A wrong name returns an error immediately.
+    Returns an empty inputs list if the subflow has no declared inputs.
+    """
+    params = {"subflow_name": subflow_name}
+    try:
+        inputs = client_get_subflow_inputs(subflow_name)
+        log_tool_call("describe_subflow", params, f"{len(inputs)} inputs returned for {subflow_name}")
+        return {
+            "subflow_name": subflow_name,
+            "input_count": len(inputs),
+            "inputs": inputs,
+            "message": (
+                f"This subflow expects {len(inputs)} input(s). "
+                "Pass these as the inputs dict to trigger_subflow."
+                if inputs else
+                "This subflow has no declared inputs. Call trigger_subflow with an empty inputs dict: {}"
+            ),
+        }
+    except Exception as e:
+        log_error("describe_subflow", params, str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def trigger_subflow(subflow_name: str, inputs: dict) -> dict:
+    """
+    Trigger a Flow Designer subflow by name with input variables.
+
+    RECOMMENDED WORKFLOW:
+      1. Call list_subflows to confirm the trigger_name
+      2. Call describe_subflow to see what inputs are expected and their types
+      3. Collect any missing inputs from the user
+      4. Call trigger_subflow with the correct input names and values
+
+    subflow_name must be in 'scope.internal_name' format.
+    Example: 'global.nowlink_test_subflow'
+
+    inputs is a dict of {variable_name: value}. Use describe_subflow to find
+    the correct variable names — passing wrong names causes silent failures
+    (ServiceNow ignores unrecognised inputs at runtime).
+
+    This tool validates inputs against the subflow's declared variables before
+    triggering. If you provide an unrecognised key, a warning is returned but
+    the subflow is still triggered (ServiceNow ignores extras). If declared
+    inputs are missing entirely, a warning is included in the response.
+
+    The subflow runs asynchronously. This tool returns immediately with an
+    execution_id. Call get_flow_status to check whether it completed.
 
     Returns:
-        {"status": "triggered", "subflow_name": ..., "execution_id": ...}
+        {"status": "triggered", "subflow_name": ..., "execution_id": ...,
+         "warnings": [...]}  # warnings only present if input issues detected
 
     If the flow bridge is not installed, tell the user to run `nowlink setup-flows`
     in their terminal first.
     """
     params = {"subflow_name": subflow_name, "inputs": inputs}
     try:
+        # Input validation — fetch declared inputs and check what was provided
+        warnings = []
+        try:
+            declared = client_get_subflow_inputs(subflow_name)
+            declared_names = {i["name"] for i in declared}
+
+            if declared:
+                provided_names = set(inputs.keys())
+
+                # Keys provided that don't match any declared input
+                unknown = provided_names - declared_names
+                if unknown:
+                    warnings.append(
+                        f"Unrecognised input(s) provided (will be ignored by ServiceNow): "
+                        f"{', '.join(sorted(unknown))}. "
+                        f"Declared inputs are: {', '.join(sorted(declared_names))}."
+                    )
+
+                # Declared inputs not provided at all
+                missing = declared_names - provided_names
+                if missing:
+                    warnings.append(
+                        f"Declared input(s) not provided: {', '.join(sorted(missing))}. "
+                        "If these are required, the subflow may fail silently. "
+                        "Call describe_subflow to review expected inputs."
+                    )
+        except Exception:
+            # Input discovery failure is non-blocking — trigger anyway
+            warnings.append(
+                "Could not retrieve declared inputs for validation. "
+                "Triggering with provided inputs as-is."
+            )
+
         result = client_trigger_subflow(subflow_name, inputs)
-        log_tool_call("trigger_subflow", params, f"triggered — execution_id={result.get('execution_id')}")
+        log_tool_call(
+            "trigger_subflow", params,
+            f"triggered — execution_id={result.get('execution_id')}"
+            + (f", {len(warnings)} warning(s)" if warnings else "")
+        )
+
+        if warnings:
+            result["warnings"] = warnings
         return result
+
     except Exception as e:
         log_error("trigger_subflow", params, str(e))
         return {"error": str(e)}

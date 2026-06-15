@@ -970,6 +970,101 @@ def list_subflows() -> list[dict]:
     return subflows
 
 
+def get_subflow_inputs(subflow_name: str) -> list[dict]:
+    """
+    Return the declared input variables for a subflow by parsing the label_cache field
+    on sys_hub_flow.
+
+    subflow_name is the trigger_name format: 'scope.internal_name'
+    e.g. 'global.nowlink_test_subflow'
+
+    ServiceNow does not expose a clean input-variable REST endpoint accessible with
+    standard roles. sys_hub_flow_input returns 403 for nowlink.dev. The label_cache
+    field on sys_hub_flow is a JSON array of ALL variables used in the flow — inputs,
+    intermediate step outputs, and loop variables. Input variables are identified by
+    name starting with "subflow." — all others are intermediate.
+
+    Input variable name to pass to trigger_subflow() is the part after "subflow.":
+      "subflow.message" → input name "message"
+
+    Returns a list of dicts, one per declared input:
+      [{"name": "message", "label": "Message", "type": "string", "choices": [...]}]
+
+    choices is only present for "choice" type inputs — it's the list of valid values.
+    There is no reliable mandatory flag in label_cache — omitted from results.
+
+    Returns [] if the subflow has no inputs or if label_cache is missing/unparseable.
+    Raises RuntimeError if the subflow cannot be found.
+    """
+    import json as _json
+
+    # Parse scope and internal_name from "scope.internal_name"
+    if "." not in subflow_name:
+        raise RuntimeError(
+            f"Invalid subflow_name format '{subflow_name}'. "
+            "Expected 'scope.internal_name', e.g. 'global.nowlink_test_subflow'."
+        )
+    parts = subflow_name.split(".", 1)
+    scope_name, internal_name = parts[0], parts[1]
+
+    params = {
+        "sysparm_query": f"internal_name={internal_name}^type=subflow^active=true",
+        "sysparm_fields": "sys_id,name,internal_name,label_cache",
+        "sysparm_limit": "1",
+        "sysparm_display_value": "true",
+    }
+    with httpx.Client(verify=False) as client:
+        r = client.get(
+            f"{_get_base_url()}/api/now/table/sys_hub_flow",
+            headers=_auth_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+    data = _handle_response(r, f"get_subflow_inputs for {subflow_name}")
+    results = data.get("result", [])
+
+    if not results:
+        raise RuntimeError(
+            f"Subflow '{subflow_name}' not found. "
+            "Use list_subflows to see available subflows and their trigger_names."
+        )
+
+    label_cache_raw = results[0].get("label_cache", "")
+    if not label_cache_raw:
+        return []
+
+    try:
+        all_vars = _json.loads(label_cache_raw)
+    except (_json.JSONDecodeError, TypeError):
+        return []
+
+    inputs = []
+    for var in all_vars:
+        name = var.get("name", "")
+        if not name.startswith("subflow."):
+            continue  # skip intermediate step variables
+
+        input_name = name[len("subflow."):]  # strip "subflow." prefix
+        label_raw = var.get("label", "")
+        # label format is "Input➛Display Name" — strip the prefix
+        label = label_raw.split("➛", 1)[-1].strip() if "➛" in label_raw else label_raw
+
+        entry = {
+            "name": input_name,
+            "label": label,
+            "type": var.get("type", "string"),
+        }
+
+        # Include choices for choice-type inputs — these are the only valid values
+        choices = var.get("choices")
+        if choices:
+            entry["choices"] = [{"label": c["label"], "value": c["value"]} for c in choices]
+
+        inputs.append(entry)
+
+    return inputs
+
+
 def describe_table(table: str) -> list[dict]:
     params = {
         "sysparm_query": f"name={table}^element!=NULL^active=true",
