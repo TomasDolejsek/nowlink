@@ -13,7 +13,8 @@ from nowlink.client import query_records, get_record_by_number, get_record_by_sy
     get_subflow_inputs as client_get_subflow_inputs, \
     list_actions as client_list_actions, get_action_inputs as client_get_action_inputs, \
     trigger_action as client_trigger_action, \
-    list_flows as client_list_flows, describe_flow as client_describe_flow
+    list_flows as client_list_flows, describe_flow as client_describe_flow, \
+    trigger_flow_with_record as client_trigger_flow_with_record
 from nowlink.shaper import shape_records, shape_record, shape_table_schema, TABLE_FIELDS
 from nowlink.safety import diff_fields, log_write
 from nowlink.logger import log_tool_call, log_error
@@ -671,9 +672,9 @@ def describe_flow(flow_name: str) -> dict:
     """
     Describe a Flow Designer flow — what triggers it and what context it expects.
 
-    Use this tool when the user asks how a flow works, what fires it, or why
-    it cannot be triggered directly. Returns the trigger context (what record/table
-    the flow expects) and a plain-English explanation of what fires the flow.
+    Use this tool when the user asks how a flow works or what fires it.
+    Do NOT use this tool when the user asks to trigger a flow — use trigger_flow instead,
+    which handles both description and execution in one call.
 
     flow_name must be in 'scope.internal_name' format — use list_flows first
     to find the correct trigger_name. Example: 'global.sla_notification_and_escalation_flow'.
@@ -698,42 +699,114 @@ def describe_flow(flow_name: str) -> dict:
 
 
 @mcp.tool()
-def trigger_flow(flow_name: str) -> dict:
+def trigger_flow(flow_name: str, sys_id: str = "") -> dict:
     """
-    Explain why a Flow Designer flow cannot be triggered via NowLink and what to do instead.
+    Trigger a Flow Designer flow, or explain why it cannot be triggered directly.
 
-    This tool does NOT trigger the flow. Flows are fired by platform events
-    (record created/updated, scheduled, catalog submission, etc.) and cannot be
-    called directly via the REST API without Integration Hub Enterprise.
+    ALWAYS use this tool when the user asks to trigger a flow — do NOT call
+    describe_flow first. This tool handles the full logic internally:
+    it inspects the trigger type and either triggers the flow or explains why it can't.
 
-    Use this tool when the user asks to trigger a flow and you need to explain
-    why it cannot be done and what the alternatives are. This tool will:
-    1. Look up the flow's trigger type and context
-    2. Explain what platform event fires it
-    3. Suggest alternatives (rebuild as Subflow, or trigger the underlying condition)
+    This tool inspects the flow's trigger type first and responds accordingly:
 
-    If the user wants to trigger automation on demand, suggest list_subflows —
-    subflows are designed for programmatic execution and work with trigger_subflow.
+    RECORD-TRIGGERED FLOWS (most common):
+      If the flow is triggered by a record event (created, updated, etc.), this tool
+      can trigger it by passing a record as context. The flow receives the record as
+      `current`, the same way it would if the platform event had fired naturally.
 
-    flow_name must be in 'scope.internal_name' format.
-    Example: 'global.sla_notification_and_escalation_flow'
+      Workflow:
+        Step 1: Call with flow_name only (no sys_id) to discover which table/record
+                the flow expects.
+        Step 2: Ask the user for a record number or sys_id from that table.
+        Step 3: Resolve the record's sys_id using get_record, then call again with
+                flow_name + sys_id.
+
+      Note: triggering a flow this way runs it against the record you provide. The
+      flow will execute all its actions — treat it the same as if the platform event
+      fired naturally. Use with care on production data.
+
+    SCHEDULED / OTHER FLOWS:
+      If the flow has no record context (scheduled, application trigger, etc.), it
+      cannot be triggered via API. This tool returns an explanation of what fires
+      the flow and suggests alternatives.
+
+    Parameters:
+    - flow_name: in 'scope.internal_name' format — use list_flows to find it.
+                 Example: 'global.review_and_approval_workflow_for_document'
+    - sys_id:    32-character sys_id of the record to pass as context.
+                 Leave empty on first call to discover what table is needed.
+
+    Returns on record trigger, no sys_id provided:
+      {"can_trigger": true, "needs_record": true, "required_table": "...",
+       "message": "Provide a sys_id from table X to trigger this flow."}
+
+    Returns on successful trigger:
+      {"triggered": true, "flow_name": ..., "execution_id": ...,
+       "message": "Flow triggered. Call get_flow_status to check completion."}
+
+    Returns on non-record flow:
+      {"can_trigger": false, "trigger_explanation": "...", "alternatives": "..."}
     """
-    params = {"flow_name": flow_name}
+    params = {"flow_name": flow_name, "sys_id": sys_id}
     try:
         flow_info = client_describe_flow(flow_name)
-        log_tool_call("trigger_flow", params, "returned trigger explanation (no execution)")
+        trigger_context = flow_info.get("trigger_context", [])
+
+        # Find record-type trigger variables — those with a table reference
+        record_triggers = [t for t in trigger_context if t.get("table")]
+
+        if not record_triggers:
+            # Scheduled or non-record flow — not triggerable via API
+            log_tool_call("trigger_flow", params, "non-record trigger — returned explanation")
+            return {
+                "can_trigger": False,
+                "flow_name": flow_info.get("name", flow_name),
+                "trigger_explanation": flow_info.get("trigger_explanation", ""),
+                "alternatives": (
+                    "This flow cannot be triggered via API. "
+                    "To run this logic on demand, rebuild it as a Subflow in Flow Designer "
+                    "and call it with trigger_subflow."
+                ),
+            }
+
+        # Record-triggered flow
+        required_table = record_triggers[0]["table"]
+        trigger_label = record_triggers[0]["label"]
+
+        if not sys_id:
+            # No record provided yet — tell the user what's needed
+            log_tool_call("trigger_flow", params, f"record trigger on {required_table} — needs sys_id")
+            return {
+                "can_trigger": True,
+                "needs_record": True,
+                "flow_name": flow_info.get("name", flow_name),
+                "required_table": required_table,
+                "trigger_context": trigger_label,
+                "message": (
+                    f"This flow is triggered by a record event on the '{required_table}' table. "
+                    f"To trigger it, provide a sys_id from that table. "
+                    f"Use get_record to find the record, then call trigger_flow again with the sys_id."
+                ),
+            }
+
+        # sys_id provided — trigger the flow via the bridge
+        result = client_trigger_flow_with_record(flow_name, required_table, sys_id)
+        log_tool_call(
+            "trigger_flow", params,
+            f"triggered on {required_table}/{sys_id} — execution_id={result.get('execution_id')}"
+        )
         return {
-            "triggered": False,
-            "reason": "Flows cannot be triggered via API — they require a platform event.",
+            "triggered": True,
             "flow_name": flow_info.get("name", flow_name),
-            "trigger_explanation": flow_info.get("trigger_explanation", ""),
-            "trigger_context": flow_info.get("trigger_context", []),
-            "alternatives": (
-                "To run this logic on demand: (1) rebuild it as a Subflow in Flow Designer "
-                "and call it with trigger_subflow, or (2) create the platform condition that "
-                "fires this flow naturally (e.g. update the relevant record)."
+            "table": required_table,
+            "sys_id": sys_id,
+            "execution_id": result.get("execution_id"),
+            "message": (
+                "Flow triggered successfully. "
+                "Call get_flow_status with the execution_id to check whether it completed."
             ),
         }
+
     except Exception as e:
         log_error("trigger_flow", params, str(e))
         return {"error": str(e)}

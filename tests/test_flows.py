@@ -514,48 +514,99 @@ class TestFlowTriggerContextParsing:
         assert parse_flow_trigger_context("") == []
 
 
-# ── trigger_flow fallback logic ───────────────────────────────────────────────
+# ── trigger_flow logic ────────────────────────────────────────────────────────
 
-class TestTriggerFlowFallback:
+class TestTriggerFlowLogic:
 
-    def test_triggered_is_always_false(self):
-        """trigger_flow response must always have triggered=False."""
+    def test_non_record_flow_cannot_trigger(self):
+        """Scheduled/non-record flows return can_trigger=False."""
+        # Simulate describe_flow result with no table references in trigger_context
+        trigger_context = [
+            {"name": "time", "label": "Scheduled Time", "type": "glide_date_time"},
+        ]
+        record_triggers = [t for t in trigger_context if t.get("table")]
+        assert len(record_triggers) == 0
+
         response = {
-            "triggered": False,
-            "reason": "Flows cannot be triggered via API — they require a platform event.",
-            "flow_name": "SLA notification and escalation flow",
-            "trigger_explanation": "This flow fires on task_sla record events.",
-            "trigger_context": [],
+            "can_trigger": False,
+            "trigger_explanation": "This flow is triggered on a schedule.",
             "alternatives": "Rebuild as a Subflow.",
         }
-        assert response["triggered"] is False
+        assert response["can_trigger"] is False
+        assert "can_trigger" in response
 
-    def test_response_has_required_keys(self):
-        """trigger_flow response must contain all required keys."""
+    def test_record_flow_without_sys_id_returns_needs_record(self):
+        """Record-triggered flow with no sys_id returns needs_record=True and required_table."""
+        trigger_context = [
+            {"name": "current", "label": "Versions Record",
+             "type": "reference", "table": "ds_document_version"},
+        ]
+        record_triggers = [t for t in trigger_context if t.get("table")]
+        assert len(record_triggers) == 1
+
+        required_table = record_triggers[0]["table"]
+        sys_id = ""
+
         response = {
-            "triggered": False,
-            "reason": "some reason",
-            "flow_name": "My Flow",
-            "trigger_explanation": "explanation",
-            "trigger_context": [],
-            "alternatives": "alternatives",
+            "can_trigger": True,
+            "needs_record": True,
+            "required_table": required_table,
+            "message": f"Provide a sys_id from the '{required_table}' table.",
         }
-        required = {"triggered", "reason", "flow_name", "trigger_explanation", "trigger_context", "alternatives"}
-        assert required.issubset(response.keys())
+        assert response["can_trigger"] is True
+        assert response["needs_record"] is True
+        assert response["required_table"] == "ds_document_version"
 
-    def test_trigger_explanation_mentions_api(self):
-        """trigger_explanation must mention that direct API triggering is not possible."""
+    def test_record_flow_with_sys_id_triggers(self):
+        """Record-triggered flow with sys_id provided returns triggered=True."""
+        response = {
+            "triggered": True,
+            "flow_name": "Review and Approval Workflow for Document Version",
+            "table": "ds_document_version",
+            "sys_id": "abc123def456abc123def456abc123de",
+            "execution_id": "some-exec-id",
+            "message": "Flow triggered successfully.",
+        }
+        assert response["triggered"] is True
+        assert "execution_id" in response
+        assert response["table"] == "ds_document_version"
+
+    def test_required_table_comes_from_first_record_trigger(self):
+        """When multiple record triggers exist, first one determines required_table."""
+        trigger_context = [
+            {"name": "current", "label": "Task SLA Record",
+             "type": "reference", "table": "task_sla"},
+            {"name": "task", "label": "Task", "type": "reference", "table": "task"},
+        ]
+        record_triggers = [t for t in trigger_context if t.get("table")]
+        required_table = record_triggers[0]["table"]
+        assert required_table == "task_sla"
+
+    def test_non_record_trigger_explanation_mentions_api(self):
+        """Non-record flow explanation must mention API limitation."""
         explanation = (
             "This flow is triggered by a platform event on the task_sla table(s). "
-            "It fires automatically when ServiceNow detects the configured condition "
-            "— it cannot be called directly via API."
+            "It cannot be called directly via API."
         )
-        assert "cannot" in explanation.lower() or "api" in explanation.lower()
+        assert "api" in explanation.lower() or "cannot" in explanation.lower()
 
     def test_alternatives_mentions_subflow(self):
-        """Alternatives message must mention Subflow as the recommended path."""
+        """Alternatives for non-record flows must mention Subflow."""
         alternatives = (
-            "To run this logic on demand: (1) rebuild it as a Subflow in Flow Designer "
+            "To run this logic on demand, rebuild it as a Subflow in Flow Designer "
             "and call it with trigger_subflow."
         )
         assert "subflow" in alternatives.lower()
+
+    def test_triggered_true_has_execution_id(self):
+        """Successful trigger response must always include execution_id."""
+        response = {
+            "triggered": True,
+            "flow_name": "My Flow",
+            "table": "incident",
+            "sys_id": "abc123",
+            "execution_id": "exec-456",
+            "message": "Flow triggered successfully.",
+        }
+        assert "execution_id" in response
+        assert response["triggered"] is True

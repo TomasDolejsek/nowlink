@@ -1155,6 +1155,43 @@ def trigger_action(action_name: str, inputs: dict) -> dict:
     return result
 
 
+def trigger_flow_with_record(flow_name: str, table_name: str, sys_id: str) -> dict:
+    """
+    Trigger a Flow Designer flow via the NowLink Flow Bridge with a record context.
+
+    Only works for record-triggered flows. The bridge fetches the GlideRecord for
+    table_name/sys_id server-side and passes it as `current` to FlowAPI.
+
+    flow_name must be in 'scope.internal_name' format.
+    table_name is the ServiceNow table the record belongs to.
+    sys_id is the 32-character sys_id of the record.
+
+    Returns:
+        {"status": "triggered", "flow_name": ..., "execution_id": ...}
+
+    Raises RuntimeError if the bridge is not installed, the record is not found,
+    or FlowAPI cannot find a flow with the given name.
+    """
+    base_url = _get_base_url()
+    bridge_url = f"{base_url}/api/{BRIDGE_NAMESPACE}/{BRIDGE_SERVICE_ID}/trigger-flow"
+
+    with httpx.Client(verify=False) as client:
+        r = client.post(
+            bridge_url,
+            headers=_auth_headers(),
+            json={"flow_name": flow_name, "table_name": table_name, "sys_id": sys_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+
+    data = _handle_response(r, f"trigger flow {flow_name}")
+    result = data.get("result", {})
+
+    if "error" in result:
+        raise RuntimeError(f"FlowAPI error triggering flow '{flow_name}': {result['error']}")
+
+    return result
+
+
 def list_flows(limit: int = 50) -> list[dict]:
     """
     Return all active, published Flow Designer flows visible to nowlink.dev.
