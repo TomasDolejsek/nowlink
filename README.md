@@ -14,12 +14,13 @@ encoded queries by hand, you ask Claude in plain language:
 
 > "Show me all P1 incidents without an assignment group"
 > "Create a test incident and assign it to the networking team"
-> "Update INC0001234 — change the priority to High"
 > "Update all open incidents assigned to the networking team to urgency High"
+> "Trigger the onboarding subflow for john.smith"
+> "Trigger the change approval flow against CHG0000024"
 
 NowLink handles the ServiceNow API calls, shapes the raw responses into clean
-token-efficient output, and keeps your credentials in your OS keychain — never in
-a file that could accidentally get committed to git.
+token-efficient output, validates inputs before any write or trigger, and keeps
+your credentials in your OS keychain — never in a file.
 
 **100% local.** Your credentials, data, and session tokens never leave your machine.
 
@@ -33,15 +34,15 @@ a file that could accidentally get committed to git.
 | v0.1 — Read | Query, get record, describe table | ✅ Complete |
 | v0.2 — Write | Create and update single records | ✅ Complete |
 | v0.3 — Safe Bulk | Preview + execute bulk operations | ✅ Complete |
-| v0.4 — Flows | Flow Designer bridge, trigger subflows | ✅ Complete (proof-of-concept) |
-| v0.5 — Smart Flows | Input discovery, validate before trigger | Planned |
+| v0.4 — Flows | Flow Designer bridge, trigger subflows | ✅ Complete |
+| v0.5 — Smart Flows | Input discovery, validate before trigger, full Flow Designer coverage | ✅ Complete |
 | v0.6 — Extensible | Plugin API, PyPI release | Planned |
 
 ---
 
 ## Tools available in Claude
 
-### Read (v0.1)
+### Read
 
 | Tool | What it does |
 |------|-------------|
@@ -49,7 +50,7 @@ a file that could accidentally get committed to git.
 | `get_record` | Fetch a single record by number (INC0001234) or sys_id |
 | `describe_table` | Show the fields and valid values for any table |
 
-### Write (v0.2)
+### Write
 
 | Tool | What it does |
 |------|-------------|
@@ -60,7 +61,7 @@ All write operations follow a mandatory two-step pattern:
 1. Claude calls the tool with `confirm=False` — shows a preview or diff, writes nothing
 2. You say yes — Claude calls again with `confirm=True` and executes the write
 
-### Bulk (v0.3)
+### Bulk
 
 | Tool | What it does |
 |------|-------------|
@@ -80,6 +81,61 @@ Every confirmed write and bulk update is logged to `~/.nowlink/logs/writes-YYYY-
 
 **NowLink will never expose a delete operation.** ServiceNow is designed around state —
 records are closed and cancelled, not deleted.
+
+### Flow Designer
+
+| Tool | What it does |
+|------|-------------|
+| `list_subflows` | List all active published subflows with their trigger names |
+| `describe_subflow` | Show a subflow's declared input variables before triggering |
+| `trigger_subflow` | Trigger a subflow by name — validates inputs before firing |
+| `get_flow_status` | Check execution status of a triggered subflow or flow |
+| `list_flows` | List all active published flows |
+| `describe_flow` | Show what triggers a flow and what record context it expects |
+| `trigger_flow` | Trigger a record-triggered flow — asks for a record, then fires via the bridge |
+| `list_actions` | List all active published Flow Designer actions |
+| `describe_action` | Show a Flow Designer action's declared input variables |
+| `trigger_action` | Trigger an action by name — validates inputs before firing |
+
+#### How subflow and action triggering works
+
+NowLink installs a Scripted REST API bridge on your ServiceNow instance (`nowlink setup-flows`).
+The bridge exposes three endpoints that call `sn_fd.FlowAPI` server-side — the only way to
+trigger Flow Designer programmatically on a standard PDI without Integration Hub Enterprise.
+
+Before triggering, NowLink queries the subflow or action definition, extracts declared input
+variables, and validates what you provided. Wrong key name? Claude tells you before firing —
+not after.
+
+```
+User: "trigger the onboarding subflow with text 'john.smith'"
+
+Claude: The input name is `username`, not `text`.
+        Do you want me to trigger it with username: "john.smith" instead?
+```
+
+#### How flow triggering works
+
+Flows have platform event triggers — record changes, schedules, catalog submissions.
+NowLink inspects each flow before attempting to trigger it:
+
+- **Record-triggered flow** — asks for a record sys_id from the required table,
+  then calls the bridge with that record as context
+- **Scheduled or event-driven flow** — explains why it cannot be triggered via API
+  and suggests rebuilding as a subflow
+
+#### Role requirements for Flow Designer tools
+
+| Tool group | Required role |
+|-----------|--------------|
+| Subflow tools | `rest_service` |
+| Flow tools | `rest_service` |
+| Action tools | `rest_service` + `flow_designer` |
+| `nowlink setup-flows` | `rest_service` + `web_service_admin` (setup only) |
+
+Action discovery requires `flow_designer` because `sys_hub_action_type_definition`
+inherits from `Application File` — the same base class as scripts and business rules.
+`web_service_admin` is only needed during bridge installation and can be removed after.
 
 ---
 
@@ -110,6 +166,16 @@ nowlink connect
 Writes the NowLink entry to `claude_desktop_config.json`. Restart Claude Desktop
 after running this.
 
+### Set up Flow Designer bridge
+
+```bash
+nowlink setup-flows
+```
+
+Creates the NowLink Flow Bridge Scripted REST API on your instance. Required once
+before using any flow, subflow, or action triggering tools. Safe to re-run —
+idempotent.
+
 ### Verify the connection
 
 ```bash
@@ -139,8 +205,8 @@ nowlink whoami
 | Password needs reset | **Unchecked** |
 
 **Important:** Identity type must be Default and Internal Integration User must be
-unchecked. Machine identity type blocks OAuth password grant entirely — ServiceNow
-returns `access_denied` with no useful explanation.
+unchecked. Machine identity type blocks OAuth password grant — ServiceNow returns
+`access_denied` with no explanation.
 
 **Important:** "Password needs reset" must be unchecked. A headless API user cannot
 complete a browser-based password reset — the OAuth flow silently fails.
@@ -149,15 +215,17 @@ complete a browser-based password reset — the OAuth flow silently fails.
 
 | Role | Required for |
 |------|-------------|
-| `rest_service` | OAuth authentication, basic API access |
+| `rest_service` | OAuth authentication, all basic API access |
 | `itil` | Read/write access to incident, problem, change, task tables |
 | `personalize_dictionary` | Read access to `sys_dictionary` (used by `describe_table`) |
+| `web_service_admin` | Installing the Flow Bridge (`nowlink setup-flows`) — can be removed after |
+| `flow_designer` | Action discovery (`list_actions`, `describe_action`, `trigger_action`) |
 
 ---
 
 ## Configuration
 
-Non-secret config lives in `.env` in the project root (never committed to git):
+Non-secret config lives in `.env` in the project root:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -193,20 +261,16 @@ For unfamiliar tables or fields, ask Claude to call `describe_table` first.
 
 ### Priority on incidents
 
-Priority is auto-calculated from impact × urgency via a business rule. Setting
-`priority` directly gets overwritten immediately. To set P1 — set `impact=1`
-and `urgency=1` and let ServiceNow derive priority automatically.
+Priority is auto-calculated from impact × urgency. Setting `priority` directly
+gets overwritten by a business rule. To set P1 — set `impact=1` and `urgency=1`.
 
 ### Mandatory field validation
 
 Before any create, NowLink walks the table inheritance chain via `sys_db_object`
-and queries `sys_dictionary` for mandatory fields — including inherited ones. A
-custom table extending `task` will have `short_description` flagged as mandatory
-if that's how your instance is configured.
+and queries `sys_dictionary` for mandatory fields including inherited ones.
 
-Note: `sys_dictionary.mandatory` reflects database-level constraints. The ServiceNow
-REST API does not enforce these — the validation is NowLink's pre-flight UX layer.
-Fields enforced only via UI Policies (browser-only) will not appear in this check.
+Note: `sys_dictionary.mandatory` reflects database-level constraints. Fields
+enforced only via UI Policies will not appear in this check.
 
 ### caller_id on incident creates
 
@@ -231,16 +295,18 @@ ruff check nowlink/
 nowlink/
 ├── nowlink/
 │   ├── auth.py      # OAuth flow, credential storage, token management
-│   ├── cli.py       # CLI entry points: init, whoami, connect, serve
-│   ├── client.py    # ServiceNow Table API HTTP wrapper + bulk operations
+│   ├── cli.py       # CLI entry points: init, whoami, connect, serve, setup-flows
+│   ├── client.py    # ServiceNow API wrapper — Table API, bulk, Flow Designer bridge
 │   ├── logger.py    # Tool call logging
 │   ├── safety.py    # Field validation, diff generation, write audit logging
-│   ├── server.py    # FastMCP server, tool definitions, session token store
+│   ├── server.py    # FastMCP server — 19 tool definitions, session token store
 │   └── shaper.py    # Data transformation — allowlists, value maps, reference resolution
 └── tests/
-    ├── test_shaper.py       # 17 tests — data transformation
-    ├── test_safety.py       # 16 tests — validation, diff, write logging
-    └── test_bulk_tokens.py  # 20 tests — session tokens, hard limit, bulk diff
+    ├── test_shaper.py           # Data transformation
+    ├── test_safety.py           # Validation, diff, write logging
+    ├── test_bulk_tokens.py      # Session tokens, hard limit, bulk diff
+    ├── test_flows.py            # Flow input parsing, validation, trigger logic
+    └── test_server_structure.py # Structural — no duplicate tool registrations
 ```
 
 ---
