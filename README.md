@@ -163,8 +163,10 @@ Credential Manager on Windows, Keychain on macOS).
 nowlink connect
 ```
 
-Writes the NowLink entry to `claude_desktop_config.json`. Restart Claude Desktop
-after running this.
+Writes the NowLink entry to `claude_desktop_config.json`. Auto-detects the correct location
+for both Store and non-Store Claude Desktop installs on Windows. If not found automatically,
+you will be prompted to paste the path from Claude Desktop's "Edit Config" menu.
+Restart Claude Desktop after running this.
 
 ### Set up Flow Designer bridge
 

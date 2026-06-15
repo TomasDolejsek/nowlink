@@ -61,8 +61,39 @@ def connect():
     from pathlib import Path
 
     # Locate claude_desktop_config.json
+    # Windows: Store install uses %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\
+    #          Non-Store install uses %APPDATA%\Claude\
+    #          If neither found automatically, ask the user.
     if sys.platform == "win32":
-        config_path = Path.home() / "AppData" / "Roaming" / "Claude" / "claude_desktop_config.json"
+        import os
+        localappdata = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        packages_dir = Path(localappdata) / "Packages"
+        config_path = None
+
+        # Step 1: Store install
+        if packages_dir.exists():
+            matches = sorted(packages_dir.glob("Claude_*/LocalCache/Roaming/Claude/claude_desktop_config.json"))
+            if matches:
+                config_path = matches[0]
+
+        # Step 2: Non-Store install fallback
+        if config_path is None:
+            appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+            fallback = Path(appdata) / "Claude" / "claude_desktop_config.json"
+            if fallback.exists():
+                config_path = fallback
+
+        # Step 3: Ask the user
+        if config_path is None:
+            console.print("[yellow]Could not find claude_desktop_config.json automatically.[/yellow]")
+            console.print("Open Claude Desktop, go to Settings > Developer > Edit Config,")
+            console.print("and paste the path shown in the file explorer title bar.")
+            user_input = input("Path to claude_desktop_config.json: ").strip().strip('"')
+            candidate = Path(user_input)
+            if not candidate.exists():
+                console.print(f"[bold red]File not found:[/bold red] {candidate}")
+                raise typer.Exit(1)
+            config_path = candidate
     else:
         config_path = Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
 
